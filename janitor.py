@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 
 import asyncio, json, logging, re, sqlite3, sys, time, tomllib
-from typing import cast, TypedDict, NotRequired, Callable, Coroutine, TypeAlias
+from functools import cached_property
+from typing import cast, Callable, Coroutine, TypeAlias
+
+from pydantic import BaseModel, computed_field, field_validator
 
 from telegram import (
     Bot,
@@ -27,15 +30,15 @@ logger = logging.getLogger("JanitorBot")
 AfterFunc: TypeAlias = Callable[[Bot, Message], Coroutine[None, None, None]]
 
 
-class Rule(TypedDict):
+class Rule(BaseModel):
     regex: str
     # None means "don't care", True means "must have media", False means "must not have media"
-    media: NotRequired[bool]
+    media: bool | None = None
     # if True, messages matching this rule will be deleted if they are edited to match, even if they previously didn't match
-    delete: NotRequired[bool]
+    delete: bool = False
 
 
-class Config(TypedDict):
+class Config(BaseModel):
     token: str
     db_name: str
     source: list[int]
@@ -50,49 +53,63 @@ class Config(TypedDict):
     purposes: dict[str, str]
     ignore_rules: list[Rule]
 
+    @field_validator("token")
+    @classmethod
+    def token_not_empty(cls, v: str) -> str:
+        assert v != "" and v != "FILLME", "Token must be set"
+        return v
+
+    @field_validator("openrouter_key")
+    @classmethod
+    def or_key_not_empty(cls, v: str) -> str:
+        assert v != "" and v != "FILLME", "OpenRouter key must be set"
+        return v
+
+    @field_validator("ignore_rules", mode="after")
+    @classmethod
+    def filter_invalid_rules(cls, v: list[Rule]) -> list[Rule]:
+        valid: list[Rule] = []
+        for rule in v:
+            try:
+                re.compile(rule.regex, re.I)
+                valid.append(rule)
+            except Exception as e:
+                logger.error("Ignoring invalid regex %s: %s", rule.regex, e)
+        return valid
+
+    @computed_field
+    @cached_property
+    def spam_pattern(self) -> str:
+        return "|".join(self.spam_regex) or "a^"
+
+    @computed_field
+    @cached_property
+    def moderated_chats(self) -> frozenset[int]:
+        """Source and moderated chats — where spam moderation is applied."""
+        return frozenset(self.source) | frozenset(self.moderated)
+
+    @computed_field
+    @cached_property
+    def spam_checked_chats(self) -> frozenset[int]:
+        """Moderated chats plus admin DM IDs — chats the bot checks for spam."""
+        return self.moderated_chats | frozenset(self.admins)
+
+    @computed_field
+    @cached_property
+    def member_chats(self) -> frozenset[int]:
+        """Moderated chats plus the channel — chats the bot is intentionally a member of."""
+        return self.moderated_chats | {self.channel}
+
 
 with open("config.toml", "rb") as file:
-    cfg = cast(Config, tomllib.load(file))
-
-token: str = cfg["token"]
-assert token != ""
-
-DB_NAME = cfg["db_name"]
-
-SOURCE = cfg["source"]
-CHANNEL = cfg["channel"]
-MODERATED = cfg["moderated"]
-ADMINS = cfg["admins"]
-MONITOR_CHAT = cfg["monitor_chat"]
-
-PURPOSES = cfg["purposes"]
-
-try_ignore_rules = cfg["ignore_rules"]
-
-spam_regexes = cfg["spam_regex"]
-spam_regex = "|".join(spam_regexes) or "a^"
-
-system_prompt = cfg["system_prompt"]
-
-openrouter_key = cfg["openrouter_key"]
-openrouter_model = cfg["openrouter_model"]
-
-ignore_rules: list[Rule] = []
-
-for rule in try_ignore_rules:
-    try:
-        re.compile(rule["regex"], re.I)
-    except Exception as e:
-        logger.error("Ignoring invalid regex %s: %s", rule["regex"], e)
-    else:
-        ignore_rules.append(rule)
+    cfg = Config.model_validate(tomllib.load(file))
 
 recent_senders: dict[int, float] = {}
-recent_dibsers: dict[int, float] = {}
+recent_ignored: dict[int, float] = {}
 RECENT = 15 * 60  # seconds
 
 
-db = sqlite3.connect(DB_NAME)
+db = sqlite3.connect(cfg.db_name)
 cursor = db.cursor()
 cursor.execute(
     """
@@ -104,7 +121,7 @@ cursor.execute(
     """
 )
 
-or_client = openrouter.OpenRouter(api_key=openrouter_key)
+or_client = openrouter.OpenRouter(api_key=cfg.openrouter_key)
 
 
 def parse_message(msg: Message) -> tuple[str, bool]:
@@ -114,9 +131,9 @@ def parse_message(msg: Message) -> tuple[str, bool]:
 
 
 def matches(rule: Rule, has_media: bool, text: str) -> bool:
-    if (must_have_media := rule.get("media")) != None and has_media != must_have_media:
+    if rule.media is not None and has_media != rule.media:
         return False
-    return bool(re.search(rule["regex"], text, re.I))
+    return bool(re.search(rule.regex, text, re.I))
 
 
 class ReplyNotFound(Exception):
@@ -134,11 +151,11 @@ def make_keyboard(msg: Message) -> InlineKeyboardMarkup:
     )
 
 
-async def delete_from_channel(bot: Bot, chat_id: int, msg_id: int):
+async def delete_from_channel(bot: Bot, msg_id: int):
     """
     Deletes a forwarded message from the channel and the DB.
     """
-    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    await bot.delete_message(chat_id=cfg.channel, message_id=msg_id)
     cursor.execute("DELETE FROM messages WHERE id = ?", [msg_id])
     db.commit()
 
@@ -147,24 +164,23 @@ async def process_message(bot: Bot, msg: Message):
     """
     After the LLM check, filter messages from the SOURCE chats and forward them to the CHANNEL if they pass.
     """
-    global recent_senders, recent_dibsers
+    global recent_senders, recent_ignored
 
     sender = cast(User, msg.from_user)
 
     # If the bot was just added to a new chat, check if it's a chat we want to be in.
     if msg.new_chat_members and any(user.id == bot.id for user in msg.new_chat_members):
         # If the chat is not known and the person who added the bot is not an admin, leave the chat.
-        if msg.chat.id not in [*SOURCE, *MODERATED, CHANNEL] and sender.id not in ADMINS:
+        if msg.chat.id not in cfg.member_chats and sender.id not in cfg.admins:
             await msg.chat.leave()
-        else:
+        elif sender.id in cfg.admins:
             # Otherwise, send the chat id to the admins so they can add it to the config.
-            await bot.send_message(
-                chat_id=ADMINS[0],
+            await sender.send_message(
                 text=f'Added to a new chat "{msg.chat.effective_name}" ({msg.chat.id})',
             )
         return
 
-    if msg.chat.id not in [*SOURCE, *MODERATED, *ADMINS]:
+    if msg.chat.id not in cfg.spam_checked_chats:
         # If the source chat is a private chat, reply with instructions.
         if msg.chat.type == "private":
             await msg.reply_text(
@@ -178,7 +194,7 @@ async def process_message(bot: Bot, msg: Message):
     # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
     if (
-        msg.chat.id in [*SOURCE, *MODERATED]
+        msg.chat.id in cfg.moderated_chats
         and fwd_from_channel
         and (
             # Forwarded from channel with inline keyboard
@@ -200,7 +216,7 @@ async def process_message(bot: Bot, msg: Message):
         return
 
     # Ignore messages outside SOURCE chats.
-    if msg.chat_id not in SOURCE:
+    if msg.chat_id not in cfg.source:
         return
 
     # Ignore messages that have no text and no media, as they are unlikely to be useful.
@@ -208,8 +224,8 @@ async def process_message(bot: Bot, msg: Message):
         return
 
     # Ignore messages that match ignore rules, and mark the user as a dibser.
-    if next((rule for rule in ignore_rules if matches(rule, has_media, text)), None):
-        recent_dibsers[sender.id] = time.time()
+    if next((rule for rule in cfg.ignore_rules if matches(rule, has_media, text)), None):
+        recent_ignored[sender.id] = time.time()
         return
 
     # Ignore short messages that have no media from users who haven't sent
@@ -218,10 +234,10 @@ async def process_message(bot: Bot, msg: Message):
     if not has_media and (len(text or "") <= 15) and sender.id not in recent_senders:
         return
 
-    # Ignore short messages that have no media from recent dibsers,
-    # as they are likely to be follow-ups to the original dibs message.
-    recent_dibsers = {user: ts for user, ts in recent_dibsers.items() if ts >= time.time() - RECENT}
-    if not has_media and (len(text or "") <= 20) and sender.id in recent_dibsers:
+    # Ignore short messages that have no media from recently ignored users,
+    # as they are likely to be follow-ups to the original ignored message.
+    recent_ignored = {user: ts for user, ts in recent_ignored.items() if ts >= time.time() - RECENT}
+    if not has_media and (len(text or "") <= 20) and sender.id in recent_ignored:
         return
 
     recent_senders[sender.id] = time.time()
@@ -237,7 +253,7 @@ async def process_message(bot: Bot, msg: Message):
             raise ReplyNotFound
 
         result = await msg.copy(
-            chat_id=CHANNEL,
+            chat_id=cfg.channel,
             reply_markup=make_keyboard(msg),
             reply_to_message_id=row[0],
         )
@@ -248,7 +264,7 @@ async def process_message(bot: Bot, msg: Message):
             isinstance(ex, BadRequest) and "replied message not found" in str(ex).lower()
         ):
             result = await msg.copy(
-                chat_id=CHANNEL,
+                chat_id=cfg.channel,
                 reply_markup=make_keyboard(msg),
             )
             new_msg_id = result.message_id
@@ -262,8 +278,8 @@ async def process_edit(bot: Bot, msg: Message):
     """
     After the LLM check, handle edits for messages forwarded to the CHANNEL.
     """
-    # Ignore edits outside SOURCE, MODERATED, and ADMINS chats.
-    if msg.chat.id not in [*SOURCE, *MODERATED, *ADMINS]:
+    # Ignore edits where we wouldn't have checked the original message for spam.
+    if msg.chat.id not in cfg.spam_checked_chats:
         return
 
     # Check for spam and react to it. If the message is likely spam, don't process it further.
@@ -271,7 +287,7 @@ async def process_edit(bot: Bot, msg: Message):
         return
 
     # Ignore edits outside SOURCE chats.
-    if msg.chat.id not in SOURCE:
+    if msg.chat.id not in cfg.source:
         return
 
     # Try to find the corresponding message in the channel.
@@ -283,14 +299,14 @@ async def process_edit(bot: Bot, msg: Message):
     text, has_media = parse_message(msg)
 
     # If the message now matches an ignore rule with delete=True, delete it from the channel.
-    if any(rule.get("delete") and matches(rule, has_media, text) for rule in ignore_rules):
-        await delete_from_channel(bot, CHANNEL, row[0])
+    if any(rule.delete and matches(rule, has_media, text) for rule in cfg.ignore_rules):
+        await delete_from_channel(bot, row[0])
         return
 
     # Otherwise, update the message in the channel to reflect the edit.
     if msg.text is not None:
         await bot.edit_message_text(
-            chat_id=CHANNEL,
+            chat_id=cfg.channel,
             message_id=row[0],
             text=msg.text,
             entities=msg.entities,
@@ -298,7 +314,7 @@ async def process_edit(bot: Bot, msg: Message):
         )
     elif msg.caption is not None:
         await bot.edit_message_caption(
-            chat_id=CHANNEL,
+            chat_id=cfg.channel,
             message_id=row[0],
             caption=msg.caption,
             caption_entities=msg.caption_entities,
@@ -315,15 +331,15 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
     sender = cast(User, msg.from_user)
     text, _ = parse_message(msg)
 
-    purpose = PURPOSES.get(str(msg.chat.id), PURPOSES[""])
+    purpose = cfg.purposes.get(str(msg.chat.id), cfg.purposes[""])
 
     response = None
     usage: str | int = "?"
     try:
         response = await or_client.chat.send_async(
-            model=openrouter_model,
+            model=cfg.openrouter_model,
             messages=[
-                {"role": "system", "content": system_prompt.format(purpose=purpose)},
+                {"role": "system", "content": cfg.system_prompt.format(purpose=purpose)},
                 {"role": "user", "content": text},
             ],
             max_tokens=3000,
@@ -366,7 +382,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
         else:
             text = f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
             await bot.send_message(
-                chat_id=ADMINS[0],
+                chat_id=cfg.admins[0],
                 reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
                 text=text[:4095],
             )
@@ -380,11 +396,11 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
         user_name = (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
         chat_name = (msg.chat.username and "@" + msg.chat.username) or msg.chat.effective_name or str(msg.chat.id)
 
-        fwd_msg = await msg.forward(chat_id=MONITOR_CHAT)
+        fwd_msg = await msg.forward(chat_id=cfg.monitor_chat)
 
         no_delete = ""
         no_ban = ""
-        if sender.id in ADMINS or msg.chat.id not in [*SOURCE, *MODERATED]:
+        if sender.id in cfg.admins or msg.chat.id not in cfg.moderated_chats:
             no_ban = "(simulation, would have been banned)\n"
         else:
             try:
@@ -403,7 +419,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
             f"Reasoning: {reasoning}"
         )
         await bot.send_message(
-            chat_id=MONITOR_CHAT,
+            chat_id=cfg.monitor_chat,
             reply_to_message_id=fwd_msg.message_id,
             text=text[:4095],
         )
@@ -411,7 +427,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
     else:
         # Not spam, but still send the reasoning to the admins for debugging.
         await bot.send_message(
-            chat_id=ADMINS[0],
+            chat_id=cfg.admins[0],
             reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
             text=f"Spam probability: {prob:.2f}\nReasoning: {reasoning}"[:4095],
         )
@@ -429,10 +445,9 @@ async def check_spam(bot: Bot, msg: Message):
     text, _ = parse_message(msg)
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
-    if chat_id in [*SOURCE, *MODERATED] and text and re.search(spam_regex, text, re.I):
-        if sender.id not in ADMINS:
-            await msg.delete()
-            await msg.chat.ban_member(user_id=sender.id)
+    if chat_id in cfg.moderated_chats and text and re.search(cfg.spam_pattern, text, re.I):
+        await msg.delete()
+        await msg.chat.ban_member(user_id=sender.id)
         return False
 
     # Short-circuit the LLM check for short messages, as they are unlikely to be spam
@@ -476,7 +491,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         msg_id = qry.message.message_id
 
-        if qry.from_user.id not in ADMINS:
+        if qry.from_user.id not in cfg.admins:
             # If the user is not an admin, check if they are the author of the message.
             cursor.execute("SELECT author FROM messages WHERE id = ?", [msg_id])
             row = cursor.fetchone()
@@ -487,7 +502,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 member = None
                 try:
                     member = await context.bot.get_chat_member(
-                        chat_id=SOURCE[0],
+                        chat_id=cfg.source[0],  # TODO: multiple sources?
                         user_id=qry.from_user.id,
                     )
                 except TelegramError:
@@ -500,14 +515,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     return
 
-        await delete_from_channel(context.bot, CHANNEL, msg_id)
+        await delete_from_channel(context.bot, msg_id)
         await qry.answer(text="Deleted!")
     except Exception:
         logger.error("Error handling callback query", exc_info=True)
 
 
 def main():
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(cfg.token).build()
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, handle_message))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited_message))
     app.add_handler(CallbackQueryHandler(handle_callback_query))

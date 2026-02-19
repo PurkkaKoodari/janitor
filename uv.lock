@@ -89,12 +89,14 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "openrouter" },
+    { name = "pydantic" },
     { name = "python-telegram-bot" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "openrouter", specifier = ">=0.6.0" },
+    { name = "pydantic", specifier = ">=2.12.5" },
     { name = "python-telegram-bot", specifier = ">=22.6" },
 ]
 
