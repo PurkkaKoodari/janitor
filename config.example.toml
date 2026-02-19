@@ -1,0 +1,54 @@
+# Telegram bot token.
+token = "FILLME"
+
+# Database file name (SQLite).
+db_name = "janitor.db"
+
+# Chats used to update the channel (also implies moderated).
+source = [-1001234567890]
+
+# Channel where messages from source are forwarded.
+channel = false
+
+# Chats that the bot moderates but doesn't forward to the channel.
+moderated = [-1001234567890]
+
+# Users allowed to add the bot to groups and delete anything from the channel.
+# admins[0] gets service messages and error reports.
+admins = [123456789]
+
+# Channel where messages deleted by the bot are forwarded for monitoring.
+monitor_chat = -1001234567890
+
+# OpenRouter API key and model name for spam detection.
+openrouter_key = "FILLME"
+openrouter_model = "openai/gpt-oss-20b"
+
+# System prompt for the AI-based spam detection.
+# {purpose} will be replaced with the chat's purpose from the [purposes] section.
+# The AI should output a probability between 0.0 and 1.0 that the message is spam.
+system_prompt = """You are a moderator for a chat group where {purpose}. Your task is to determine whether the user's message is spam.
+
+You frequently encounter spam related to cryptocurrency, fake remote work opportunities, investments and online casinos, but other spam is also present. Messages related to the group's purpose, or people selling items or asking normal questions, or posting student projects are likely not spam.
+
+Output a probability between 0.0 and 1.0 that the message is spam."""
+
+# Map chat IDs (as strings) to a description of each chat's purpose.
+# The "" key is used as the fallback.
+[purposes]
+"" = "people post cool messages"
+"-1001234567890" = "people post cool messages"
+
+# Hardcoded regex patterns that indicate spam.
+# If any pattern matches, the message is considered spam without consulting the AI.
+spam_regex = [
+    "spammy phrase 1",
+]
+
+# channel_ignore: messages matching any rule are not forwarded to the channel.
+# Fields:
+#   regex  – case-insensitive pattern
+#   media  – omit (don't care) | true (must have media) | false (must not have media)
+#   delete – if true, forwarded copies are deleted when a message is edited to match this rule
+[[channel_ignore]]
+regex = "example"
