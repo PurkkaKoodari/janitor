@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import asyncio, json, logging, re, sqlite3, sys, time, tomllib
+import asyncio, json, logging, os, re, sqlite3, sys, threading, time, tomllib
 from functools import cached_property
 from typing import cast, Callable, Coroutine, TypeAlias
 
@@ -24,6 +24,7 @@ from openrouter.components import ResponseFormatJSONSchema, JSONSchemaConfig
 
 format = "%(asctime)s [%(name)s] [%(levelname)s] %(message)s"
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=format)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("JanitorBot")
 
 
@@ -556,7 +557,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error("Error handling callback query", exc_info=True)
 
 
+def _watch_and_restart():
+    watched = ["janitor.py", "config.toml"]
+    mtimes = {f: os.path.getmtime(f) for f in watched}
+    while True:
+        time.sleep(1)
+        for f in watched:
+            try:
+                mtime = os.path.getmtime(f)
+            except OSError:
+                continue
+            if mtime != mtimes[f]:
+                logger.info("File %s changed, restarting...", f)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def main():
+    threading.Thread(target=_watch_and_restart, daemon=True).start()
     app = Application.builder().token(cfg.bot_token).build()
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, handle_message))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited_message))
