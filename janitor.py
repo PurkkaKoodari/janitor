@@ -3,7 +3,16 @@
 import asyncio, json, logging, re, sqlite3, sys, time, tomllib
 from typing import cast, TypedDict, NotRequired, Callable, Coroutine, TypeAlias
 
-from telegram import Bot, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message, ReplyParameters, Update, User
+from telegram import (
+    Bot,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    Message,
+    ReplyParameters,
+    Update,
+    User,
+)
 from telegram.error import TelegramError, BadRequest
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
@@ -25,6 +34,7 @@ class Rule(TypedDict):
     # if True, messages matching this rule will be deleted if they are edited to match, even if they previously didn't match
     delete: NotRequired[bool]
 
+
 class Config(TypedDict):
     token: str
     db_name: str
@@ -39,6 +49,7 @@ class Config(TypedDict):
     spam_regex: list[str]
     purposes: dict[str, str]
     ignore_rules: list[Rule]
+
 
 with open("config.toml", "rb") as file:
     cfg = cast(Config, tomllib.load(file))
@@ -83,32 +94,17 @@ RECENT = 15 * 60  # seconds
 
 db = sqlite3.connect(DB_NAME)
 cursor = db.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    id BIGINT PRIMARY KEY,
-    orig_id BIGINT,
-    author BIGINT
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS messages (
+        id BIGINT PRIMARY KEY,
+        orig_id BIGINT,
+        author BIGINT
+    )
+    """
 )
-""")
 
 or_client = openrouter.OpenRouter(api_key=openrouter_key)
-
-
-class ReplyNotFound(Exception):
-    pass
-
-
-def matches(rule: Rule, has_media: bool, text: str) -> bool:
-    if (must_have_media := rule.get("media")) != None and has_media != must_have_media:
-        return False
-    return bool(re.search(rule["regex"], text, re.I))
-
-
-def make_keyboard(msg: Message) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("See message", url=msg.link),
-        InlineKeyboardButton("Delete this", callback_data="delete:" + str(msg.message_id)),
-    ]])
 
 
 def parse_message(msg: Message) -> tuple[str, bool]:
@@ -117,12 +113,34 @@ def parse_message(msg: Message) -> tuple[str, bool]:
     return text, has_media
 
 
-async def delete_from_channel(bot: Bot, chat_id: int, msg_id: int, qry_id: str | None = None):
+def matches(rule: Rule, has_media: bool, text: str) -> bool:
+    if (must_have_media := rule.get("media")) != None and has_media != must_have_media:
+        return False
+    return bool(re.search(rule["regex"], text, re.I))
+
+
+class ReplyNotFound(Exception):
+    pass
+
+
+def make_keyboard(msg: Message) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("See message", url=msg.link),
+                InlineKeyboardButton("Delete this", callback_data="delete:" + str(msg.message_id)),
+            ]
+        ]
+    )
+
+
+async def delete_from_channel(bot: Bot, chat_id: int, msg_id: int):
+    """
+    Deletes a forwarded message from the channel and the DB.
+    """
     await bot.delete_message(chat_id=chat_id, message_id=msg_id)
     cursor.execute("DELETE FROM messages WHERE id = ?", [msg_id])
     db.commit()
-    if qry_id:
-        await bot.answer_callback_query(callback_query_id=qry_id, text="Deleted!")
 
 
 async def process_message(bot: Bot, msg: Message):
@@ -134,19 +152,16 @@ async def process_message(bot: Bot, msg: Message):
     sender = cast(User, msg.from_user)
 
     # If the bot was just added to a new chat, check if it's a chat we want to be in.
-    if (
-        msg.new_chat_members
-        and any(user.id == bot.id for user in msg.new_chat_members)
-    ):
+    if msg.new_chat_members and any(user.id == bot.id for user in msg.new_chat_members):
         # If the chat is not known and the person who added the bot is not an admin, leave the chat.
-        if (
-            msg.chat.id not in [*SOURCE, *MODERATED, CHANNEL]
-            and sender.id not in ADMINS
-        ):
+        if msg.chat.id not in [*SOURCE, *MODERATED, CHANNEL] and sender.id not in ADMINS:
             await msg.chat.leave()
         else:
             # Otherwise, send the chat id to the admins so they can add it to the config.
-            await bot.send_message(chat_id=ADMINS[0], text=f"Added to a new chat \"{msg.chat.effective_name}\" ({msg.chat.id})")
+            await bot.send_message(
+                chat_id=ADMINS[0],
+                text=f'Added to a new chat "{msg.chat.effective_name}" ({msg.chat.id})',
+            )
         return
 
     if msg.chat.id not in [*SOURCE, *MODERATED, *ADMINS]:
@@ -162,11 +177,19 @@ async def process_message(bot: Bot, msg: Message):
 
     # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
-    if msg.chat.id in [*SOURCE, *MODERATED] and fwd_from_channel and (
-        # Forwarded from channel with inline keyboard
-        msg.reply_markup
-        # Forwarded from channel, contains a link or mention, and contains Cyrillic
-        or (fwd_from_channel and text and re.search(r"@\w+|https?://t\.me|https?://vk\.", text) and re.search(r"[\u0400-\u052F]", text, re.I))
+    if (
+        msg.chat.id in [*SOURCE, *MODERATED]
+        and fwd_from_channel
+        and (
+            # Forwarded from channel with inline keyboard
+            msg.reply_markup
+            # Forwarded from channel, contains a link to VK or Telegram, and contains Cyrillic
+            or (
+                text
+                and re.search(r"@\w+|https?://t\.me|https?://vk\.", text)
+                and re.search(r"[\u0400-\u052F]", text, re.I)
+            )
+        )
     ):
         await msg.delete()
         await msg.chat.ban_member(user_id=sender.id)
@@ -221,7 +244,9 @@ async def process_message(bot: Bot, msg: Message):
         new_msg_id = result.message_id
     except Exception as ex:
         # If the message is not a reply, or if we can't find the replied message in the channel, just post it without replying.
-        if isinstance(ex, ReplyNotFound) or (isinstance(ex, BadRequest) and "replied message not found" in str(ex).lower()):
+        if isinstance(ex, ReplyNotFound) or (
+            isinstance(ex, BadRequest) and "replied message not found" in str(ex).lower()
+        ):
             result = await msg.copy(
                 chat_id=CHANNEL,
                 reply_markup=make_keyboard(msg),
@@ -299,7 +324,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
             model=openrouter_model,
             messages=[
                 {"role": "system", "content": system_prompt.format(purpose=purpose)},
-                {"role": "user",   "content": text},
+                {"role": "user", "content": text},
             ],
             max_tokens=3000,
             temperature=0.5,
@@ -339,10 +364,11 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
             await asyncio.sleep(1)
             return await llm_check(bot, msg, retry=retry - 1)
         else:
+            text = f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
             await bot.send_message(
                 chat_id=ADMINS[0],
                 reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-                text=f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"[:4095],
+                text=text[:4095],
             )
             # Fail open to avoid false positives.
             return True
@@ -351,23 +377,15 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
 
     if prob >= 0.9:
         # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
-        user_name = (
-            (sender.username and "@" + sender.username)
-            or sender.full_name
-            or str(sender.id)
-        )
-        chat_name = (
-            (msg.chat.username and "@" + msg.chat.username)
-            or msg.chat.effective_name
-            or str(msg.chat.id)
-        )
+        user_name = (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
+        chat_name = (msg.chat.username and "@" + msg.chat.username) or msg.chat.effective_name or str(msg.chat.id)
 
         fwd_msg = await msg.forward(chat_id=MONITOR_CHAT)
 
         no_delete = ""
         no_ban = ""
         if sender.id in ADMINS or msg.chat.id not in [*SOURCE, *MODERATED]:
-            no_ban = "(simulated ban in DMs)\n"
+            no_ban = "(simulation, would have been banned)\n"
         else:
             try:
                 await msg.delete()
@@ -378,10 +396,16 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
             except TelegramError as ex:
                 no_ban = f"Failed to ban: {ex}\n"
 
+        text = (
+            f"Posted by {user_name} in {chat_name}\n"
+            f"Spam probability: {prob:.2f}\n"
+            f"{no_delete}{no_ban}"
+            f"Reasoning: {reasoning}"
+        )
         await bot.send_message(
             chat_id=MONITOR_CHAT,
             reply_to_message_id=fwd_msg.message_id,
-            text=f"Posted by {user_name} in {chat_name}\nSpam probability: {prob:.2f}\n{no_delete}{no_ban}Reasoning: {reasoning}"[:4095],
+            text=text[:4095],
         )
         return False
     else:
@@ -446,17 +470,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         if not qry.message:
+            # This should fall back on the DB, but nobody uses it so I don't care.
             await qry.answer(text="Message not found, maybe it's too old?")
             return
 
         msg_id = qry.message.message_id
 
         if qry.from_user.id not in ADMINS:
+            # If the user is not an admin, check if they are the author of the message.
             cursor.execute("SELECT author FROM messages WHERE id = ?", [msg_id])
             row = cursor.fetchone()
             author = row[0] if row else None
 
             if qry.from_user.id != author:
+                # If not, check if they are an admin of the source chat.
                 member = None
                 try:
                     member = await context.bot.get_chat_member(
@@ -466,14 +493,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 except TelegramError:
                     member = None
                 if (not member) or member.status not in ("creator", "administrator"):
+                    # If not, they have no business deleting this message.
                     await qry.answer(
                         text="You can only delete your own messages. Please ask an admin to delete this.",
                         show_alert=True,
                     )
                     return
 
-        await delete_from_channel(context.bot, CHANNEL, msg_id, qry.id)
-        await qry.answer()
+        await delete_from_channel(context.bot, CHANNEL, msg_id)
+        await qry.answer(text="Deleted!")
     except Exception:
         logger.error("Error handling callback query", exc_info=True)
 
