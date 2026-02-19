@@ -1,4 +1,21 @@
 #!/usr/bin/env python
+#
+# This is a Telegram bot that moderates chats with the help of an LLM.
+#
+# Copyright (C) 2026 PurkkaKoodari
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio, json, logging, os, re, sqlite3, sys, threading, time, tomllib
 from functools import cached_property
@@ -93,6 +110,7 @@ class Config(BaseModel):
     bot_token: str
     db_name: str
     admins: list[int]
+    admin_name: str
     spam: SpamConfig
     chats: ChatsConfig
     llm: LLMConfig
@@ -210,7 +228,7 @@ async def process_message(bot: Bot, msg: Message):
         # If the source chat is a private chat, reply with instructions.
         if msg.chat.type == "private":
             await msg.reply_text(
-                text="Hello! This bot is for moderating groups. Please talk to @purkka if you need help from me.",
+                text=f"Hello! This bot is for moderating groups.\n\nPlease talk to {cfg.admin_name} if you want to use this instance.\n\nSource code: https://github.com/PurkkaKoodari/janitor",
             )
         # Ignore messages from unknown chats.
         return

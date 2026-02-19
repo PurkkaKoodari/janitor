@@ -8,6 +8,9 @@ db_name = "janitor.db"
 # admins[0] gets service messages and error reports.
 admins = [123456789]
 
+# User name mentioned when unknown users message the bot: "please talk to {admin_name}".
+admin_name = "your mom"
+
 [chats]
 # Chats used to update the channel (also implies moderated).
 source = [-1001234567890]
