@@ -1,28 +1,35 @@
 # Telegram bot token.
-token = "FILLME"
+bot_token = "FILLME"
 
 # Database file name (SQLite).
 db_name = "janitor.db"
-
-# Chats used to update the channel (also implies moderated).
-source = [-1001234567890]
-
-# Channel where messages from source are forwarded.
-channel = false
-
-# Chats that the bot moderates but doesn't forward to the channel.
-moderated = [-1001234567890]
 
 # Users allowed to add the bot to groups and delete anything from the channel.
 # admins[0] gets service messages and error reports.
 admins = [123456789]
 
-# Channel where messages deleted by the bot are forwarded for monitoring.
-monitor_chat = -1001234567890
+[chats]
+# Chats used to update the channel (also implies moderated).
+source = [-1001234567890]
 
+# Channel where messages from source are forwarded.
+channel = 0
+
+# Chats that the bot moderates but doesn't forward to the channel.
+moderated = [-1001234567890]
+
+# Channel where messages deleted by the bot are forwarded for monitoring.
+monitor = -1001234567890
+
+[spam]
+# Hardcoded regex patterns that indicate spam.
+# If any pattern matches, the message is considered spam without consulting the AI.
+regex = ["spammy phrase 1"]
+
+[llm]
 # OpenRouter API key and model name for spam detection.
 openrouter_key = "FILLME"
-openrouter_model = "openai/gpt-oss-20b"
+model = "openai/gpt-oss-20b"
 
 # System prompt for the AI-based spam detection.
 # {purpose} will be replaced with the chat's purpose from the [purposes] section.
@@ -33,22 +40,29 @@ You frequently encounter spam related to cryptocurrency, fake remote work opport
 
 Output a probability between 0.0 and 1.0 that the message is spam."""
 
+# Threshold above which messages are considered spam and deleted.
+threshold = 0.9
+
 # Map chat IDs (as strings) to a description of each chat's purpose.
-# The "" key is used as the fallback.
-[purposes]
-"" = "people post cool messages"
+# The default key is used as the fallback.
+[llm.chat_purposes]
+default = "people post cool messages"
 "-1001234567890" = "people post cool messages"
 
-# Hardcoded regex patterns that indicate spam.
-# If any pattern matches, the message is considered spam without consulting the AI.
-spam_regex = [
-    "spammy phrase 1",
-]
+[channel_ignore]
+# Duration for the next two settings.
+recent_seconds = 900 # 15 min
 
-# channel_ignore: messages matching any rule are not forwarded to the channel.
+# Minimum message length to consider "useful" from users that haven't sent useful messages in recent_seconds.
+length_min_from_silent = 15
+
+# Minimum message length to consider "useful" from users that have sent ignored messages in recent_seconds.
+length_min_from_ignored = 20
+
+# channel_ignore.rules: messages matching any rule are not forwarded to the channel.
 # Fields:
 #   regex  – case-insensitive pattern
 #   media  – omit (don't care) | true (must have media) | false (must not have media)
 #   delete – if true, forwarded copies are deleted when a message is edited to match this rule
-[[channel_ignore]]
+[[channel_ignore.rules]]
 regex = "example"
