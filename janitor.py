@@ -169,7 +169,12 @@ or_client = openrouter.OpenRouter(api_key=cfg.llm.openrouter_key)
 
 
 def parse_message(msg: Message) -> tuple[str, bool]:
-    has_media = bool(msg.photo) or msg.document is not None or msg.video is not None or msg.video_note is not None
+    has_media = (
+        bool(msg.photo)
+        or msg.document is not None
+        or msg.video is not None
+        or msg.video_note is not None
+    )
     text = msg.text or msg.caption or ""
     return text, has_media
 
@@ -277,7 +282,11 @@ async def process_message(bot: Bot, msg: Message):
     for user, ts in list(recent_senders.items()):
         if ts < time.time() - cfg.channel_ignore.recent_seconds:
             del recent_senders[user]
-    if sender.id not in recent_senders and not has_media and len(text) <= cfg.channel_ignore.length_min_from_silent:
+    if (
+        sender.id not in recent_senders
+        and not has_media
+        and len(text) <= cfg.channel_ignore.length_min_from_silent
+    ):
         return
 
     # Ignore short messages that have no media from recently ignored users,
@@ -285,7 +294,11 @@ async def process_message(bot: Bot, msg: Message):
     for user, ts in list(recent_ignored.items()):
         if ts < time.time() - cfg.channel_ignore.recent_seconds:
             del recent_ignored[user]
-    if sender.id in recent_ignored and not has_media and len(text) <= cfg.channel_ignore.length_min_from_ignored:
+    if (
+        sender.id in recent_ignored
+        and not has_media
+        and len(text) <= cfg.channel_ignore.length_min_from_ignored
+    ):
         return
 
     recent_senders[sender.id] = time.time()
@@ -295,7 +308,9 @@ async def process_message(bot: Bot, msg: Message):
         # If this message is a reply, try to find the corresponding message in the channel and reply to it.
         if not msg.reply_to_message:
             raise ReplyNotFound
-        cursor.execute("SELECT id FROM messages WHERE orig_id = ?", [msg.reply_to_message.message_id])
+        cursor.execute(
+            "SELECT id FROM messages WHERE orig_id = ?", [msg.reply_to_message.message_id]
+        )
         row = cursor.fetchone()
         if not row:
             raise ReplyNotFound
@@ -318,7 +333,9 @@ async def process_message(bot: Bot, msg: Message):
             new_msg_id = result.message_id
 
     if new_msg_id:
-        cursor.execute("INSERT INTO messages VALUES (?, ?, ?)", [new_msg_id, msg.message_id, sender.id])
+        cursor.execute(
+            "INSERT INTO messages VALUES (?, ?, ?)", [new_msg_id, msg.message_id, sender.id]
+        )
         db.commit()
 
 
@@ -376,7 +393,6 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
 
     Returns True if the message is likely not spam, False if it is likely spam.
     """
-    sender = cast(User, msg.from_user)
     text, _ = parse_message(msg)
 
     purpose = cfg.llm.chat_purposes.get(str(msg.chat.id), cfg.llm.chat_purposes["default"])
@@ -424,7 +440,13 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
                 reasoning = response.choices[0].message.reasoning or ""
             except Exception:
                 pass
-        logger.error("LLM check failed, %s tokens, result: %s, reasoning: %s", usage, content, reasoning, exc_info=True)
+        logger.error(
+            "LLM check failed, %s tokens, result: %s, reasoning: %s",
+            usage,
+            content,
+            reasoning,
+            exc_info=True,
+        )
         if retry:
             await asyncio.sleep(1)
             return await llm_check(bot, msg, retry=retry - 1)
@@ -442,42 +464,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
 
     if prob >= cfg.llm.threshold:
         # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
-        user_name = (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
-        chat_name = (msg.chat.username and "@" + msg.chat.username) or msg.chat.effective_name or str(msg.chat.id)
-
-        fwd_msg = None
-        if cfg.chats.monitor:
-            try:
-                fwd_msg = await msg.forward(chat_id=cfg.chats.monitor)
-            except TelegramError:
-                logger.warning("Failed to forward message to monitor chat", exc_info=True)
-
-        no_delete = ""
-        no_ban = ""
-        if sender.id in cfg.admins or msg.chat.id not in cfg.moderated_chats:
-            no_ban = "(simulation, would have been banned)\n"
-        else:
-            try:
-                await msg.delete()
-            except TelegramError as ex:
-                no_delete = f"Failed to delete: {ex}\n"
-            try:
-                await msg.chat.ban_member(user_id=sender.id)
-            except TelegramError as ex:
-                no_ban = f"Failed to ban: {ex}\n"
-
-        if cfg.chats.monitor and fwd_msg:
-            text = (
-                f"Posted by {user_name} in {chat_name}\n"
-                f"Spam probability: {prob:.2f}\n"
-                f"{no_delete}{no_ban}"
-                f"Reasoning: {reasoning}"
-            )
-            await bot.send_message(
-                chat_id=cfg.chats.monitor,
-                reply_to_message_id=fwd_msg.message_id,
-                text=text[:4095],
-            )
+        await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning)
         return False
     else:
         # Not spam, but still send the reasoning to the admins for debugging.
@@ -496,13 +483,13 @@ async def check_spam(bot: Bot, msg: Message):
     Returns True if the message is likely not spam, False if it is likely spam.
     """
     chat_id = msg.chat.id
-    sender = cast(User, msg.from_user)
     text, _ = parse_message(msg)
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
     if chat_id in cfg.moderated_chats and text and re.search(cfg.spam_pattern, text, re.I):
-        await msg.delete()
-        await msg.chat.ban_member(user_id=sender.id)
+        logger.info("Message matches spam regex, banning without LLM check!")
+        matching_regex = next((regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None)
+        await attempt_delete_ban(bot, msg, reasoning=f"Matched spam regex: {matching_regex}")
         return False
 
     # Short-circuit the LLM check for short messages, as they are unlikely to be spam
@@ -514,6 +501,57 @@ async def check_spam(bot: Bot, msg: Message):
         logger.info("LLM checking message...")
         # For other messages, run the LLM check and then process them in the after function.
         return await llm_check(bot, msg)
+
+
+async def attempt_delete_ban(
+    bot: Bot, msg: Message, prob: float | None = None, reasoning: str | None = None
+):
+    """
+    Attempt to delete the message and ban the sender, and forward the message to the monitor chat with the reasoning.
+    """
+    sender = cast(User, msg.from_user)
+
+    fwd_msg = None
+    if cfg.chats.monitor:
+        try:
+            fwd_msg = await msg.forward(chat_id=cfg.chats.monitor)
+        except TelegramError:
+            logger.warning("Failed to forward message to monitor chat", exc_info=True)
+
+    no_delete = ""
+    no_ban = ""
+    if sender.id in cfg.admins or msg.chat.id not in cfg.moderated_chats:
+        no_ban = "(simulation, would have been banned)\n"
+    else:
+        try:
+            await msg.delete()
+        except TelegramError as ex:
+            no_delete = f"\nFailed to delete: {ex}"
+        try:
+            await msg.chat.ban_member(user_id=sender.id)
+        except TelegramError as ex:
+            no_ban = f"\nFailed to ban: {ex}"
+
+    if cfg.chats.monitor and fwd_msg:
+        user_name = (
+            (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
+        )
+        chat_name = (
+            (msg.chat.username and "@" + msg.chat.username)
+            or msg.chat.effective_name
+            or str(msg.chat.id)
+        )
+        text = (
+            f"Posted by {user_name} in {chat_name}"
+            + (f"\nSpam probability: {prob:.2f}" if prob is not None else "")
+            + f"{no_delete}{no_ban}"
+            + (f"\nReasoning: {reasoning}" if reasoning else "")
+        )
+        await bot.send_message(
+            chat_id=cfg.chats.monitor,
+            reply_to_message_id=fwd_msg.message_id,
+            text=text[:4095],
+        )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
