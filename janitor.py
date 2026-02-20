@@ -383,6 +383,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
 
     response = None
     usage: str | int = "?"
+    content = "?"
     try:
         response = await or_client.chat.send_async(
             model=cfg.llm.model,
@@ -423,7 +424,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
                 reasoning = response.choices[0].message.reasoning or ""
             except Exception:
                 pass
-        logger.error("LLM check failed, %s tokens, reasoning: %s", usage, reasoning, exc_info=True)
+        logger.error("LLM check failed, %s tokens, result: %s, reasoning: %s", usage, content, reasoning, exc_info=True)
         if retry:
             await asyncio.sleep(1)
             return await llm_check(bot, msg, retry=retry - 1)
