@@ -256,8 +256,10 @@ async def process_message(bot: Bot, msg: Message):
             )
         )
     ):
-        await msg.delete()
-        await msg.chat.ban_member(user_id=sender.id)
+        reason = "inline keyboard" if msg.reply_markup else "Cyrillic and suspicious links"
+        await attempt_delete_ban(
+            bot, msg, reasoning=f"Forwarded message from channel with {reason}"
+        )
         return
 
     # Check for spam and react to it. If the message is likely spam, don't process it further.
@@ -393,9 +395,14 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
 
     Returns True if the message is likely not spam, False if it is likely spam.
     """
+    sender = cast(User, msg.from_user)
     text, _ = parse_message(msg)
 
-    purpose = cfg.llm.chat_purposes.get(str(msg.chat.id), cfg.llm.chat_purposes["default"])
+    if sender.id in cfg.admins and text.startswith("purpose: ") and "\n" in text:
+        purpose, _, text = text[len("purpose: ") :].partition("\n")
+        logger.info("Using custom purpose from admin: %s", purpose)
+    else:
+        purpose = cfg.llm.chat_purposes.get(str(msg.chat.id), cfg.llm.chat_purposes["default"])
 
     response = None
     usage: str | int = "?"
@@ -488,7 +495,9 @@ async def check_spam(bot: Bot, msg: Message):
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
     if chat_id in cfg.moderated_chats and text and re.search(cfg.spam_pattern, text, re.I):
         logger.info("Message matches spam regex, banning without LLM check!")
-        matching_regex = next((regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None)
+        matching_regex = next(
+            (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
+        )
         await attempt_delete_ban(bot, msg, reasoning=f"Matched spam regex: {matching_regex}")
         return False
 
@@ -518,6 +527,7 @@ async def attempt_delete_ban(
         except TelegramError:
             logger.warning("Failed to forward message to monitor chat", exc_info=True)
 
+    monitor = sender.id if sender.id in cfg.admins else cfg.chats.monitor
     no_delete = ""
     no_ban = ""
     if sender.id in cfg.admins or msg.chat.id not in cfg.moderated_chats:
@@ -532,7 +542,7 @@ async def attempt_delete_ban(
         except TelegramError as ex:
             no_ban = f"\nFailed to ban: {ex}"
 
-    if cfg.chats.monitor and fwd_msg:
+    if monitor and fwd_msg:
         user_name = (
             (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
         )
@@ -548,7 +558,7 @@ async def attempt_delete_ban(
             + (f"\nReasoning: {reasoning}" if reasoning else "")
         )
         await bot.send_message(
-            chat_id=cfg.chats.monitor,
+            chat_id=monitor,
             reply_to_message_id=fwd_msg.message_id,
             text=text[:4095],
         )
