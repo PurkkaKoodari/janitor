@@ -179,7 +179,8 @@ cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS chats (
         id BIGINT PRIMARY KEY,
-        purpose TEXT
+        purpose TEXT,
+        mode TEXT NOT NULL DEFAULT 'ban'
     )
     """
 )
@@ -192,9 +193,11 @@ cursor.execute(
 )
 
 db_chat_purposes: dict[int, str | None] = {}
-cursor.execute("SELECT id, purpose FROM chats")
+db_chat_mode: dict[int, str] = {}
+cursor.execute("SELECT id, purpose, mode FROM chats")
 for _row in cursor.fetchall():
     db_chat_purposes[_row[0]] = _row[1]
+    db_chat_mode[_row[0]] = _row[2]
 
 db_admins: set[int] = set()
 cursor.execute("SELECT id FROM admins")
@@ -221,9 +224,24 @@ def effective_member_chats() -> frozenset[int]:
 
 
 def chat_purpose(chat_id: int) -> str:
-    if chat_id in db_chat_purposes and db_chat_purposes[chat_id] is not None:
-        return db_chat_purposes[chat_id]  # type: ignore[return-value]
-    return cfg.llm.chat_purposes.get(str(chat_id), cfg.llm.chat_purposes["default"])
+    return db_chat_purposes.get(chat_id) or cfg.llm.chat_purposes.get(
+        str(chat_id), cfg.llm.chat_purposes["default"]
+    )
+
+
+def chat_mode(chat_id: int) -> str:
+    return db_chat_mode.get(chat_id, "ban")
+
+
+def parse_chat_id(s: str) -> int | None:
+    """Parse a group/supergroup chat ID (must be a negative integer)."""
+    try:
+        chat_id = int(s)
+        if chat_id >= 0:
+            return None
+        return chat_id
+    except ValueError:
+        return None
 
 
 def parse_message(msg: Message) -> tuple[str, bool]:
@@ -595,16 +613,23 @@ async def attempt_delete_ban(
     no_delete = ""
     no_ban = ""
     if sender.id in effective_admins() or msg.chat.id not in effective_moderated_chats():
-        no_ban = "\n(simulation, would have been banned)"
+        no_ban = "\n(simulation, would have been deleted/banned)"
     else:
-        try:
-            await msg.delete()
-        except TelegramError as ex:
-            no_delete = f"\nFailed to delete: {ex}"
-        try:
-            await msg.chat.ban_member(user_id=sender.id)
-        except TelegramError as ex:
-            no_ban = f"\nFailed to ban: {ex}"
+        mode = chat_mode(msg.chat.id)
+        if mode == "test":
+            no_ban = "\n(test mode, no action taken)"
+        else:
+            try:
+                await msg.delete()
+            except TelegramError as ex:
+                no_delete = f"\nFailed to delete: {ex}"
+            if mode != "ban":
+                no_ban = "\n(banning disabled for this chat)"
+            else:
+                try:
+                    await msg.chat.ban_member(user_id=sender.id)
+                except TelegramError as ex:
+                    no_ban = f"\nFailed to ban: {ex}"
 
     if monitor:
         user_name = (
@@ -631,6 +656,7 @@ async def attempt_delete_ban(
 ADMIN_COMMANDS = [
     BotCommand("moderate", "Enable/update moderation for a chat"),
     BotCommand("unmoderate", "Remove a chat from moderated chats"),
+    BotCommand("mode", "Set moderation mode for a chat (test/delete/ban)"),
 ]
 SUPERADMIN_COMMANDS = ADMIN_COMMANDS + [
     BotCommand("admin", "Add a user as admin"),
@@ -661,11 +687,8 @@ async def handle_moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(args) < 1:
             await msg.reply_text("Usage: /moderate <chat_id> [purpose...]")
             return
-        try:
-            chat_id = int(args[0])
-            if chat_id >= 0:
-                raise ValueError("Chat ID must be negative for groups/supergroups")
-        except ValueError:
+        chat_id = parse_chat_id(args[0])
+        if chat_id is None:
             await msg.reply_text("Invalid chat ID.")
             return
         try:
@@ -697,7 +720,13 @@ async def handle_moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Purpose is too long, must be at most 200 characters.")
             return
         cursor.execute(
-            "INSERT OR REPLACE INTO chats (id, purpose) VALUES (?, ?)", [chat_id, purpose]
+            """
+            INSERT INTO chats (id, purpose)
+            VALUES (?, ?)
+            ON CONFLICT(id) DO UPDATE
+            SET purpose = excluded.purpose
+            """,
+            [chat_id, purpose],
         )
         db.commit()
         db_chat_purposes[chat_id] = purpose
@@ -728,11 +757,8 @@ async def handle_unmoderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(args) != 1:
             await msg.reply_text("Usage: /unmoderate <chat_id>")
             return
-        try:
-            chat_id = int(args[0])
-            if chat_id >= 0:
-                raise ValueError("Chat ID must be negative for groups/supergroups")
-        except ValueError:
+        chat_id = parse_chat_id(args[0])
+        if chat_id is None:
             await msg.reply_text("Invalid chat ID.")
             return
         if chat_id in cfg.moderated_chats:
@@ -758,6 +784,52 @@ async def handle_unmoderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception:
         logger.error("Error handling /unmoderate", exc_info=True)
+
+
+async def handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        if sender.id not in effective_admins():
+            return
+        args = context.args or []
+        if len(args) != 2:
+            await msg.reply_text("Usage: /mode <chat_id> <test|delete|ban>")
+            return
+        chat_id = parse_chat_id(args[0])
+        if chat_id is None:
+            await msg.reply_text("Invalid chat ID.")
+            return
+        if args[1] not in ("test", "delete", "ban"):
+            await msg.reply_text("Invalid mode, must be 'test', 'delete', or 'ban'.")
+            return
+        mode = args[1]
+        if chat_id not in effective_moderated_chats():
+            await msg.reply_text(f"Chat {chat_id} is not a moderated chat.")
+            return
+        cursor.execute(
+            """
+            INSERT INTO chats (id, purpose, mode)
+            VALUES (?, NULL, ?)
+            ON CONFLICT(id) DO UPDATE
+            SET mode = excluded.mode
+            """,
+            [chat_id, mode],
+        )
+        db.commit()
+        db_chat_mode[chat_id] = mode
+        await msg.reply_text(f"Moderation mode for chat {chat_id} set to '{mode}'.")
+        if cfg.chats.monitor and cfg.chats.monitor != msg.chat.id:
+            sender_name = (
+                (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
+            )
+            await context.bot.send_message(
+                chat_id=cfg.chats.monitor,
+                text=f"{escape(sender_name)} set moderation mode to <b>{mode}</b> for chat <code>{chat_id}</code>.",
+                parse_mode="HTML",
+            )
+    except Exception:
+        logger.error("Error handling /mode", exc_info=True)
 
 
 async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -921,6 +993,7 @@ def main():
     )
     app.add_handler(CommandHandler("moderate", handle_moderate))
     app.add_handler(CommandHandler("unmoderate", handle_unmoderate))
+    app.add_handler(CommandHandler("mode", handle_mode))
     app.add_handler(CommandHandler("hello", handle_hello))
     app.add_handler(CommandHandler("admin", handle_admin))
     app.add_handler(CommandHandler("unadmin", handle_unadmin))
