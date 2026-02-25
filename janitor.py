@@ -806,7 +806,7 @@ async def handle_hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"User sent /hello: <code>{sender.id}</code>",
             parse_mode="HTML",
         )
-        await msg.set_reaction("👋")
+        await msg.set_reaction("👍")
     except Exception:
         logger.error("Error handling /hello", exc_info=True)
 
