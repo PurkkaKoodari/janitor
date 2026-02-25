@@ -29,6 +29,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeChat,
     CallbackQuery,
+    ChatMemberAdministrator,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     Message,
@@ -667,6 +668,30 @@ async def handle_moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await msg.reply_text("Invalid chat ID.")
             return
+        try:
+            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+            if bot_member.status not in ("administrator", "creator"):
+                await msg.reply_text(
+                    f"Warning: bot is not an admin in chat {chat_id}. "
+                    "Moderation may not work correctly."
+                )
+            elif bot_member.status == "administrator":
+                bot_member = cast(ChatMemberAdministrator, bot_member)
+                missing: list[str] = []
+                if not bot_member.can_delete_messages:
+                    missing.append("delete messages")
+                if not bot_member.can_restrict_members:
+                    missing.append("ban members")
+                if missing:
+                    await msg.reply_text(
+                        f"Warning: bot is missing permissions in chat {chat_id}: {', '.join(missing)}. "
+                        "Moderation may not work correctly."
+                    )
+        except Exception:
+            await msg.reply_text(
+                f"Warning: could not check bot permissions in chat {chat_id} "
+                "(bot may not be a member). Moderation may not work correctly."
+            )
         purpose: str | None = " ".join(args[1:]) if args[1:] else None
         if purpose and len(purpose) > 200:
             await msg.reply_text("Purpose is too long, must be at most 200 characters.")
