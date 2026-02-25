@@ -519,15 +519,15 @@ async def attempt_delete_ban(
     Attempt to delete the message and ban the sender, and forward the message to the monitor chat with the reasoning.
     """
     sender = cast(User, msg.from_user)
+    monitor = sender.id if sender.id in cfg.admins else cfg.chats.monitor
 
     fwd_msg = None
-    if cfg.chats.monitor:
+    if monitor:
         try:
-            fwd_msg = await msg.forward(chat_id=cfg.chats.monitor)
+            fwd_msg = await msg.forward(chat_id=monitor)
         except TelegramError:
             logger.warning("Failed to forward message to monitor chat", exc_info=True)
 
-    monitor = sender.id if sender.id in cfg.admins else cfg.chats.monitor
     no_delete = ""
     no_ban = ""
     if sender.id in cfg.admins or msg.chat.id not in cfg.moderated_chats:
@@ -542,7 +542,7 @@ async def attempt_delete_ban(
         except TelegramError as ex:
             no_ban = f"\nFailed to ban: {ex}"
 
-    if monitor and fwd_msg:
+    if monitor:
         user_name = (
             (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
         )
@@ -559,7 +559,7 @@ async def attempt_delete_ban(
         )
         await bot.send_message(
             chat_id=monitor,
-            reply_to_message_id=fwd_msg.message_id,
+            reply_to_message_id=fwd_msg.message_id if fwd_msg else None,
             text=text[:4095],
         )
 
