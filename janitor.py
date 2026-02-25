@@ -19,6 +19,7 @@
 
 import asyncio, json, logging, os, re, sqlite3, sys, threading, time, tomllib
 from functools import cached_property
+from html import escape
 from typing import cast, Callable, Coroutine, TypeAlias
 
 from pydantic import BaseModel, computed_field, field_validator
@@ -34,7 +35,14 @@ from telegram import (
     User,
 )
 from telegram.error import TelegramError, BadRequest
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 import openrouter
 from openrouter.components import ResponseFormatJSONSchema, JSONSchemaConfig
@@ -164,8 +172,39 @@ cursor.execute(
     )
     """
 )
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS chats (
+        id BIGINT PRIMARY KEY,
+        purpose TEXT
+    )
+    """
+)
+
+db_chat_purposes: dict[int, str | None] = {}
+cursor.execute("SELECT id, purpose FROM chats")
+for _row in cursor.fetchall():
+    db_chat_purposes[_row[0]] = _row[1]
 
 or_client = openrouter.OpenRouter(api_key=cfg.llm.openrouter_key)
+
+
+def effective_moderated_chats() -> frozenset[int]:
+    return cfg.moderated_chats | frozenset(db_chat_purposes.keys())
+
+
+def effective_spam_checked_chats() -> frozenset[int]:
+    return effective_moderated_chats() | frozenset(cfg.admins)
+
+
+def effective_member_chats() -> frozenset[int]:
+    return effective_moderated_chats() | {cfg.chats.channel}
+
+
+def chat_purpose(chat_id: int) -> str:
+    if chat_id in db_chat_purposes and db_chat_purposes[chat_id] is not None:
+        return db_chat_purposes[chat_id]  # type: ignore[return-value]
+    return cfg.llm.chat_purposes.get(str(chat_id), cfg.llm.chat_purposes["default"])
 
 
 def parse_message(msg: Message) -> tuple[str, bool]:
@@ -220,16 +259,22 @@ async def process_message(bot: Bot, msg: Message):
     # If the bot was just added to a new chat, check if it's a chat we want to be in.
     if msg.new_chat_members and any(user.id == bot.id for user in msg.new_chat_members):
         # If the chat is not known and the person who added the bot is not an admin, leave the chat.
-        if msg.chat.id not in cfg.member_chats and sender.id not in cfg.admins:
+        if msg.chat.id not in effective_member_chats() and sender.id not in cfg.admins:
             await msg.chat.leave()
         elif sender.id in cfg.admins:
             # Otherwise, send the chat id to the admins so they can add it to the config.
-            await sender.send_message(
-                text=f'Added to a new chat "{msg.chat.effective_name}" ({msg.chat.id})',
+            sender_name = (
+                (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
+            )
+            monitor = cfg.chats.monitor or sender.id
+            await bot.send_message(
+                chat_id=monitor,
+                text=f'{sender_name} added the bot to a new chat "{escape(msg.chat.effective_name or "")}" (ID <code>{msg.chat.id}</code>).',
+                parse_mode="HTML",
             )
         return
 
-    if msg.chat.id not in cfg.spam_checked_chats:
+    if msg.chat.id not in effective_spam_checked_chats():
         # If the source chat is a private chat, reply with instructions.
         if msg.chat.type == "private":
             await msg.reply_text(
@@ -243,7 +288,7 @@ async def process_message(bot: Bot, msg: Message):
     # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
     if (
-        msg.chat.id in cfg.moderated_chats
+        msg.chat.id in effective_moderated_chats()
         and fwd_from_channel
         and (
             # Forwarded from channel with inline keyboard
@@ -346,7 +391,7 @@ async def process_edit(bot: Bot, msg: Message):
     After the LLM check, handle edits for messages forwarded to the CHANNEL.
     """
     # Ignore edits where we wouldn't have checked the original message for spam.
-    if msg.chat.id not in cfg.spam_checked_chats:
+    if msg.chat.id not in effective_spam_checked_chats():
         return
 
     # Check for spam and react to it. If the message is likely spam, don't process it further.
@@ -402,7 +447,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
         purpose, _, text = text[len("purpose: ") :].partition("\n")
         logger.info("Using custom purpose from admin: %s", purpose)
     else:
-        purpose = cfg.llm.chat_purposes.get(str(msg.chat.id), cfg.llm.chat_purposes["default"])
+        purpose = chat_purpose(msg.chat.id)
 
     response = None
     usage: str | int = "?"
@@ -493,7 +538,7 @@ async def check_spam(bot: Bot, msg: Message):
     text, _ = parse_message(msg)
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
-    if chat_id in cfg.moderated_chats and text and re.search(cfg.spam_pattern, text, re.I):
+    if chat_id in effective_moderated_chats() and text and re.search(cfg.spam_pattern, text, re.I):
         logger.info("Message matches spam regex, banning without LLM check!")
         matching_regex = next(
             (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
@@ -530,8 +575,8 @@ async def attempt_delete_ban(
 
     no_delete = ""
     no_ban = ""
-    if sender.id in cfg.admins or msg.chat.id not in cfg.moderated_chats:
-        no_ban = "(simulation, would have been banned)\n"
+    if sender.id in cfg.admins or msg.chat.id not in effective_moderated_chats():
+        no_ban = "\n(simulation, would have been banned)"
     else:
         try:
             await msg.delete()
@@ -562,6 +607,91 @@ async def attempt_delete_ban(
             reply_to_message_id=fwd_msg.message_id if fwd_msg else None,
             text=text[:4095],
         )
+
+
+async def handle_moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        if sender.id not in cfg.admins:
+            return
+        args = context.args or []
+        if len(args) < 1:
+            await msg.reply_text("Usage: /moderate <chat_id> [purpose...]")
+            return
+        try:
+            chat_id = int(args[0])
+            if chat_id >= 0:
+                raise ValueError("Chat ID must be negative for groups/supergroups")
+        except ValueError:
+            await msg.reply_text("Invalid chat ID.")
+            return
+        purpose: str | None = " ".join(args[1:]) if args[1:] else None
+        if purpose and len(purpose) > 200:
+            await msg.reply_text("Purpose is too long, must be at most 200 characters.")
+            return
+        cursor.execute(
+            "INSERT OR REPLACE INTO chats (id, purpose) VALUES (?, ?)", [chat_id, purpose]
+        )
+        db.commit()
+        db_chat_purposes[chat_id] = purpose
+        purpose_display = purpose or chat_purpose(chat_id) + " (default)"
+        await msg.reply_text(
+            f'Chat {chat_id} moderation enabled/updated.\nThe LLM will be told it\'s in "a chat group where {purpose_display}".'
+        )
+        if cfg.chats.monitor and cfg.chats.monitor != msg.chat.id:
+            sender_name = (
+                (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
+            )
+            await context.bot.send_message(
+                chat_id=cfg.chats.monitor,
+                text=f"{escape(sender_name)} enabled/updated moderation for chat <code>{chat_id}</code>.\nNew purpose: {escape(purpose_display)}",
+                parse_mode="HTML",
+            )
+    except Exception:
+        logger.error("Error handling /moderate", exc_info=True)
+
+
+async def handle_unmoderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        if sender.id not in cfg.admins:
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /unmoderate <chat_id>")
+            return
+        try:
+            chat_id = int(args[0])
+            if chat_id >= 0:
+                raise ValueError("Chat ID must be negative for groups/supergroups")
+        except ValueError:
+            await msg.reply_text("Invalid chat ID.")
+            return
+        if chat_id in cfg.moderated_chats:
+            await msg.reply_text(
+                f"Chat {chat_id} is in the static config and cannot be removed via this command. Use /moderate to revert it to the default purpose instead."
+            )
+            return
+        if chat_id not in db_chat_purposes:
+            await msg.reply_text(f"Chat {chat_id} is not in the moderated chats database.")
+            return
+        cursor.execute("DELETE FROM chats WHERE id = ?", [chat_id])
+        db.commit()
+        del db_chat_purposes[chat_id]
+        await msg.reply_text(f"Chat {chat_id} removed from moderated chats.")
+        if cfg.chats.monitor and cfg.chats.monitor != msg.chat.id:
+            sender_name = (
+                (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
+            )
+            await context.bot.send_message(
+                chat_id=cfg.chats.monitor,
+                text=f"{escape(sender_name)} removed chat <code>{chat_id}</code> from moderated chats.",
+                parse_mode="HTML",
+            )
+    except Exception:
+        logger.error("Error handling /unmoderate", exc_info=True)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -642,6 +772,8 @@ def _watch_and_restart():
 def main():
     threading.Thread(target=_watch_and_restart, daemon=True).start()
     app = Application.builder().token(cfg.bot_token).build()
+    app.add_handler(CommandHandler("moderate", handle_moderate))
+    app.add_handler(CommandHandler("unmoderate", handle_unmoderate))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, handle_message))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited_message))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
