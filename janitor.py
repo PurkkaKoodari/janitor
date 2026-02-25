@@ -659,6 +659,7 @@ ADMIN_COMMANDS = [
     BotCommand("mode", "Set moderation mode for a chat (test/delete/ban)"),
 ]
 SUPERADMIN_COMMANDS = ADMIN_COMMANDS + [
+    BotCommand("chats", "List all moderated chats"),
     BotCommand("admin", "Add a user as admin"),
     BotCommand("unadmin", "Remove a user from admins"),
 ]
@@ -894,6 +895,46 @@ async def handle_unadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Error handling /unadmin", exc_info=True)
 
 
+CHATS_PAGE_SIZE = 15
+
+
+def build_chats_page(page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    all_chats = sorted(effective_moderated_chats())
+    total = len(all_chats)
+    total_pages = max(1, (total + CHATS_PAGE_SIZE - 1) // CHATS_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * CHATS_PAGE_SIZE
+    chats_page = all_chats[start : start + CHATS_PAGE_SIZE]
+
+    lines = [f"Moderated chats (page {page}/{total_pages}):"]
+    for chat_id in chats_page:
+        purpose = chat_purpose(chat_id)
+        mode = chat_mode(chat_id)
+        lines.append(f"{chat_id}: {mode} \u2014 {purpose}")
+
+    buttons: list[InlineKeyboardButton] = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("\u25c4 Previous", callback_data=f"chats:{page - 1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next \u25ba", callback_data=f"chats:{page + 1}"))
+
+    keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
+    return "\n".join(lines), keyboard
+
+
+async def handle_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        if sender.id != cfg.admins[0]:
+            return
+        text, keyboard = build_chats_page(1)
+        await msg.reply_text(text, reply_markup=keyboard)
+    except Exception:
+        logger.error("Error handling /chats", exc_info=True)
+
+
 async def handle_hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.message)
@@ -927,7 +968,23 @@ async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         qry = cast(CallbackQuery, update.callback_query)
-        if not (qry.data or "").startswith("delete:"):
+        data = qry.data or ""
+
+        if data.startswith("chats:"):
+            if qry.from_user.id != cfg.admins[0]:
+                await qry.answer()
+                return
+            try:
+                page = int(data.split(":", 1)[1])
+            except (ValueError, IndexError):
+                await qry.answer(text="Invalid page")
+                return
+            text, keyboard = build_chats_page(page)
+            await qry.edit_message_text(text, reply_markup=keyboard)
+            await qry.answer()
+            return
+
+        if not data.startswith("delete:"):
             await qry.answer(text="Invalid button")
             return
 
@@ -994,6 +1051,7 @@ def main():
     app.add_handler(CommandHandler("moderate", handle_moderate))
     app.add_handler(CommandHandler("unmoderate", handle_unmoderate))
     app.add_handler(CommandHandler("mode", handle_mode))
+    app.add_handler(CommandHandler("chats", handle_chats))
     app.add_handler(CommandHandler("hello", handle_hello))
     app.add_handler(CommandHandler("admin", handle_admin))
     app.add_handler(CommandHandler("unadmin", handle_unadmin))
