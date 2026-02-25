@@ -20,12 +20,14 @@
 import asyncio, json, logging, os, re, sqlite3, sys, threading, time, tomllib
 from functools import cached_property
 from html import escape
-from typing import cast, Callable, Coroutine, TypeAlias
+from typing import Any, cast, Callable, Coroutine, TypeAlias
 
 from pydantic import BaseModel, computed_field, field_validator
 
 from telegram import (
     Bot,
+    BotCommand,
+    BotCommandScopeChat,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -180,13 +182,29 @@ cursor.execute(
     )
     """
 )
+cursor.execute(
+    """
+    CREATE TABLE IF NOT EXISTS admins (
+        id BIGINT PRIMARY KEY
+    )
+    """
+)
 
 db_chat_purposes: dict[int, str | None] = {}
 cursor.execute("SELECT id, purpose FROM chats")
 for _row in cursor.fetchall():
     db_chat_purposes[_row[0]] = _row[1]
 
+db_admins: set[int] = set()
+cursor.execute("SELECT id FROM admins")
+for _row in cursor.fetchall():
+    db_admins.add(_row[0])
+
 or_client = openrouter.OpenRouter(api_key=cfg.llm.openrouter_key)
+
+
+def effective_admins() -> frozenset[int]:
+    return frozenset(cfg.admins) | db_admins
 
 
 def effective_moderated_chats() -> frozenset[int]:
@@ -194,7 +212,7 @@ def effective_moderated_chats() -> frozenset[int]:
 
 
 def effective_spam_checked_chats() -> frozenset[int]:
-    return effective_moderated_chats() | frozenset(cfg.admins)
+    return effective_moderated_chats() | effective_admins()
 
 
 def effective_member_chats() -> frozenset[int]:
@@ -259,9 +277,9 @@ async def process_message(bot: Bot, msg: Message):
     # If the bot was just added to a new chat, check if it's a chat we want to be in.
     if msg.new_chat_members and any(user.id == bot.id for user in msg.new_chat_members):
         # If the chat is not known and the person who added the bot is not an admin, leave the chat.
-        if msg.chat.id not in effective_member_chats() and sender.id not in cfg.admins:
+        if msg.chat.id not in effective_member_chats() and sender.id not in effective_admins():
             await msg.chat.leave()
-        elif sender.id in cfg.admins:
+        elif sender.id in effective_admins():
             # Otherwise, send the chat id to the admins so they can add it to the config.
             sender_name = (
                 (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
@@ -443,7 +461,7 @@ async def llm_check(bot: Bot, msg: Message, *, retry: int = 2) -> bool:
     sender = cast(User, msg.from_user)
     text, _ = parse_message(msg)
 
-    if sender.id in cfg.admins and text.startswith("purpose: ") and "\n" in text:
+    if sender.id in effective_admins() and text.startswith("purpose: ") and "\n" in text:
         purpose, _, text = text[len("purpose: ") :].partition("\n")
         logger.info("Using custom purpose from admin: %s", purpose)
     else:
@@ -564,7 +582,7 @@ async def attempt_delete_ban(
     Attempt to delete the message and ban the sender, and forward the message to the monitor chat with the reasoning.
     """
     sender = cast(User, msg.from_user)
-    monitor = sender.id if sender.id in cfg.admins else cfg.chats.monitor
+    monitor = sender.id if sender.id in effective_admins() else cfg.chats.monitor
 
     fwd_msg = None
     if monitor:
@@ -575,7 +593,7 @@ async def attempt_delete_ban(
 
     no_delete = ""
     no_ban = ""
-    if sender.id in cfg.admins or msg.chat.id not in effective_moderated_chats():
+    if sender.id in effective_admins() or msg.chat.id not in effective_moderated_chats():
         no_ban = "\n(simulation, would have been banned)"
     else:
         try:
@@ -609,11 +627,34 @@ async def attempt_delete_ban(
         )
 
 
+ADMIN_COMMANDS = [
+    BotCommand("moderate", "Enable/update moderation for a chat"),
+    BotCommand("unmoderate", "Remove a chat from moderated chats"),
+]
+SUPERADMIN_COMMANDS = ADMIN_COMMANDS + [
+    BotCommand("admin", "Add a user as admin"),
+    BotCommand("unadmin", "Remove a user from admins"),
+]
+
+
+async def set_admin_commands(bot: Bot, user_id: int) -> None:
+    commands = SUPERADMIN_COMMANDS if user_id == cfg.admins[0] else ADMIN_COMMANDS
+    try:
+        await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=user_id))
+    except TelegramError:
+        logger.warning("Could not set commands for user %s", user_id, exc_info=True)
+
+
+async def post_init(app: Application[Bot, Any, Any, Any, Any, Any]) -> None:
+    for user_id in effective_admins():
+        await set_admin_commands(app.bot, user_id)
+
+
 async def handle_moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.message)
         sender = cast(User, msg.from_user)
-        if sender.id not in cfg.admins:
+        if sender.id not in effective_admins():
             return
         args = context.args or []
         if len(args) < 1:
@@ -656,7 +697,7 @@ async def handle_unmoderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.message)
         sender = cast(User, msg.from_user)
-        if sender.id not in cfg.admins:
+        if sender.id not in effective_admins():
             return
         args = context.args or []
         if len(args) != 1:
@@ -694,6 +735,82 @@ async def handle_unmoderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Error handling /unmoderate", exc_info=True)
 
 
+async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        if sender.id != cfg.admins[0]:
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /admin <user_id>")
+            return
+        try:
+            user_id = int(args[0])
+        except ValueError:
+            await msg.reply_text("Invalid user ID.")
+            return
+        if user_id in cfg.admins:
+            await msg.reply_text(f"User {user_id} is already a static admin.")
+            return
+        cursor.execute("INSERT OR IGNORE INTO admins (id) VALUES (?)", [user_id])
+        db.commit()
+        db_admins.add(user_id)
+        await set_admin_commands(context.bot, user_id)
+        await msg.reply_text(f"User {user_id} added as admin.")
+    except Exception:
+        logger.error("Error handling /admin", exc_info=True)
+
+
+async def handle_unadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        if sender.id != cfg.admins[0]:
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await msg.reply_text("Usage: /unadmin <user_id>")
+            return
+        try:
+            user_id = int(args[0])
+        except ValueError:
+            await msg.reply_text("Invalid user ID.")
+            return
+        if user_id in cfg.admins:
+            await msg.reply_text(
+                f"User {user_id} is a static admin and cannot be removed via this command."
+            )
+            return
+        if user_id not in db_admins:
+            await msg.reply_text(f"User {user_id} is not in the admins database.")
+            return
+        cursor.execute("DELETE FROM admins WHERE id = ?", [user_id])
+        db.commit()
+        db_admins.discard(user_id)
+        try:
+            await context.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=user_id))
+        except TelegramError:
+            logger.warning("Could not clear commands for user %s", user_id, exc_info=True)
+        await msg.reply_text(f"User {user_id} removed from admins.")
+    except Exception:
+        logger.error("Error handling /unadmin", exc_info=True)
+
+
+async def handle_hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        await context.bot.send_message(
+            chat_id=cfg.admins[0],
+            text=f"User sent /hello: <code>{sender.id}</code>",
+            parse_mode="HTML",
+        )
+        await msg.set_reaction("👋")
+    except Exception:
+        logger.error("Error handling /hello", exc_info=True)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.message)
@@ -724,7 +841,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         msg_id = qry.message.message_id
 
-        if qry.from_user.id not in cfg.admins:
+        if qry.from_user.id not in effective_admins():
             # If the user is not an admin, check if they are the author of the message.
             cursor.execute("SELECT author FROM messages WHERE id = ?", [msg_id])
             row = cursor.fetchone()
@@ -771,9 +888,17 @@ def _watch_and_restart():
 
 def main():
     threading.Thread(target=_watch_and_restart, daemon=True).start()
-    app = Application.builder().token(cfg.bot_token).build()
+    app = (
+        Application.builder()
+        .token(cfg.bot_token)
+        .post_init(post_init)  # pyright: ignore[reportUnknownMemberType]
+        .build()
+    )
     app.add_handler(CommandHandler("moderate", handle_moderate))
     app.add_handler(CommandHandler("unmoderate", handle_unmoderate))
+    app.add_handler(CommandHandler("hello", handle_hello))
+    app.add_handler(CommandHandler("admin", handle_admin))
+    app.add_handler(CommandHandler("unadmin", handle_unadmin))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, handle_message))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited_message))
     app.add_handler(CallbackQueryHandler(handle_callback_query))

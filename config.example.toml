@@ -5,7 +5,7 @@ bot_token = "FILLME"
 db_name = "janitor.db"
 
 # Users allowed to add the bot to groups and delete anything from the channel.
-# admins[0] gets service messages and error reports.
+# admins[0] is a super admin that can assign new admins and gets some service messages and error reports.
 admins = [123456789]
 
 # User name mentioned when unknown users message the bot: "please talk to {admin_name}".
