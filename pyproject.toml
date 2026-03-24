@@ -11,6 +11,9 @@ dependencies = [
     "python-telegram-bot>=22.6",
 ]
 
+[tool.setuptools]
+py-modules = []
+
 [tool.black]
 line-length = 100
 target-version = ["py311"]
