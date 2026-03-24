@@ -484,6 +484,7 @@ async def llm_check(text: str, purpose: str, *, retry: int = 2) -> tuple[float, 
             max_tokens=3000,
             temperature=0.5,
             response_format=ResponseFormatJSONSchema(
+                type="json_schema",
                 json_schema=JSONSchemaConfig(
                     name="spam_prob",
                     strict=True,
