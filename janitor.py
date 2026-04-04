@@ -48,7 +48,7 @@ from telegram.ext import (
 )
 
 import openrouter
-from openrouter.components import ResponseFormatJSONSchema, JSONSchemaConfig
+from openrouter.components import ChatResponse, ResponseFormatJSONSchema, JSONSchemaConfig
 
 format = "%(asctime)s [%(name)s] [%(levelname)s] %(message)s"
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format=format)
@@ -81,6 +81,9 @@ class SpamConfig(BaseModel):
 class LLMConfig(BaseModel):
     openrouter_key: str
     model: str
+    timeout: float = 15.0
+    retry_delay: float = 1.0
+    retry_count: int = 2
     system_prompt: str
     threshold: float
     chat_purposes: dict[str, str]
@@ -465,7 +468,42 @@ async def process_edit(bot: Bot, msg: Message):
         )
 
 
-async def llm_check(text: str, purpose: str, *, retry: int = 2) -> tuple[float, str]:
+async def llm_api(text: str, purpose: str) -> ChatResponse:
+    """
+    Call the LLM API with the given text and purpose, and return the response.
+    """
+    return await or_client.chat.send_async(
+        model=cfg.llm.model,
+        messages=[
+            {"role": "system", "content": cfg.llm.system_prompt.format(purpose=purpose)},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=3000,
+        temperature=0.5,
+        response_format=ResponseFormatJSONSchema(
+            type="json_schema",
+            json_schema=JSONSchemaConfig(
+                name="spam_prob",
+                strict=True,
+                schema_={
+                    "type": "object",
+                    "properties": {
+                        "prob": {
+                            "type": "number",
+                            "description": "Probability that the message is spam",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                    },
+                    "required": ["prob"],
+                    "additionalProperties": False,
+                },
+            ),
+        ),
+    )
+
+
+async def llm_check(key: str, text: str, purpose: str, *, retry: int = cfg.llm.retry_count) -> tuple[float, str]:
     """
     Check the message with the LLM and react to spam.
 
@@ -475,39 +513,11 @@ async def llm_check(text: str, purpose: str, *, retry: int = 2) -> tuple[float, 
     usage: str | int = "?"
     content = "?"
     try:
-        response = await or_client.chat.send_async(
-            model=cfg.llm.model,
-            messages=[
-                {"role": "system", "content": cfg.llm.system_prompt.format(purpose=purpose)},
-                {"role": "user", "content": text},
-            ],
-            max_tokens=3000,
-            temperature=0.5,
-            response_format=ResponseFormatJSONSchema(
-                type="json_schema",
-                json_schema=JSONSchemaConfig(
-                    name="spam_prob",
-                    strict=True,
-                    schema_={
-                        "type": "object",
-                        "properties": {
-                            "prob": {
-                                "type": "number",
-                                "description": "Probability that the message is spam",
-                                "minimum": 0,
-                                "maximum": 1,
-                            },
-                        },
-                        "required": ["prob"],
-                        "additionalProperties": False,
-                    },
-                ),
-            ),
-        )
+        response = await asyncio.wait_for(llm_api(text, purpose), timeout=cfg.llm.timeout)
         usage = int(response.usage.total_tokens) if response.usage else "?"
         content = cast(str, response.choices[0].message.content)
         prob = json.loads(content)["prob"]
-        logger.info("LLM check complete, %s tokens, spam probability: %.2f", usage, prob)
+        logger.info("[%s] LLM check complete, %s tokens, spam probability: %.2f", key, usage, prob)
     except Exception as e:
         reasoning = ""
         if response is not None:
@@ -516,15 +526,16 @@ async def llm_check(text: str, purpose: str, *, retry: int = 2) -> tuple[float, 
             except Exception:
                 pass
         logger.error(
-            "LLM check failed, %s tokens, result: %s, reasoning: %s",
+            "[%s] LLM check failed, %s tokens, result: %s, reasoning: %s",
+            key,
             usage,
             content,
             reasoning,
             exc_info=True,
         )
         if retry:
-            await asyncio.sleep(1)
-            return await llm_check(text, purpose, retry=retry - 1)
+            await asyncio.sleep(cfg.llm.retry_delay)
+            return await llm_check(key, text, purpose, retry=retry - 1)
         else:
             raise RuntimeError(
                 f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
@@ -546,7 +557,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
     if chat_id in effective_moderated_chats() and text and re.search(cfg.spam_pattern, text, re.I):
-        logger.info("Message matches spam regex, banning without LLM check!")
+        logger.info("[%s:%s] Message matches spam regex, banning without LLM check!", msg.chat.id, msg.id)
         matching_regex = next(
             (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
         )
@@ -556,20 +567,20 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     # Short-circuit the LLM check for short messages, as they are unlikely to be spam
     # and it's not worth the cost to check them.
     if len(text) < 20:
-        logger.info("Short message, skipping LLM check!")
+        logger.info("[%s:%s] Short message, skipping LLM check!", msg.chat.id, msg.id)
         return True
     
     # For other messages, run the LLM check and then process them in the after function.
     # Allow admins to override the purpose.
-    logger.info("LLM checking message...")
+    logger.info("[%s:%s] LLM checking message...", msg.chat.id, msg.id)
     if sender.id in effective_admins() and text.startswith("purpose: ") and "\n" in text:
         purpose, _, text = text[len("purpose: ") :].partition("\n")
-        logger.info("Using custom purpose from admin: %s", purpose)
+        logger.info("[%s:%s] Using custom purpose from admin: %s", msg.chat.id, msg.id, purpose)
     else:
         purpose = chat_purpose(msg.chat.id)
     # Now run the LLM check and react to the result.
     try:
-        prob, reasoning = await llm_check(text, purpose)
+        prob, reasoning = await llm_check(f"{msg.chat.id}:{msg.id}", text, purpose)
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning)

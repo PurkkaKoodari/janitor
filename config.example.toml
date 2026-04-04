@@ -34,6 +34,14 @@ regex = ["spammy phrase 1"]
 openrouter_key = "FILLME"
 model = "openai/gpt-oss-20b"
 
+# Timeout in seconds for the LLM API call. Timeouts cause a retry.
+timeout = 15.0
+# Retry delay in seconds after a timeout or other error when calling the LLM API.
+retry_delay = 1.0
+# Number of times to retry the LLM API call after a timeout or other error.
+# If all retries fail, the message is not considered spam.
+retry_count = 3
+
 # System prompt for the AI-based spam detection.
 # {purpose} will be replaced with the chat's purpose from the [purposes] section.
 # The AI should output a probability between 0.0 and 1.0 that the message is spam.
