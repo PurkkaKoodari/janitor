@@ -6,13 +6,16 @@ readme = "README.md"
 license = "AGPL-3.0-or-later"
 requires-python = ">=3.13"
 dependencies = [
-    "openrouter>=0.6.0",
-    "pydantic>=2.12.5",
-    "python-telegram-bot>=22.6",
+    "openrouter>=0.9.1",
+    "pydantic>=2.13.4",
+    "python-telegram-bot",
 ]
 
 [tool.setuptools]
 py-modules = []
+
+[tool.uv.sources]
+python-telegram-bot = { git = "https://github.com/python-telegram-bot/python-telegram-bot", rev = "a7ff5fb7919ceb8e488980999d6c55aaa6fd2153" }
 
 [tool.black]
 line-length = 100
@@ -20,5 +23,5 @@ target-version = ["py313"]
 
 [dependency-groups]
 dev = [
-    "black>=26.1.0",
+    "black>=26.5.1",
 ]

@@ -503,7 +503,9 @@ async def llm_api(text: str, purpose: str) -> ChatResponse:
     )
 
 
-async def llm_check(key: str, text: str, purpose: str, *, retry: int = cfg.llm.retry_count) -> tuple[float, str]:
+async def llm_check(
+    key: str, text: str, purpose: str, *, retry: int = cfg.llm.retry_count
+) -> tuple[float, str]:
     """
     Check the message with the LLM and react to spam.
 
@@ -557,7 +559,9 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
     if chat_id in effective_moderated_chats() and text and re.search(cfg.spam_pattern, text, re.I):
-        logger.info("[%s:%s] Message matches spam regex, banning without LLM check!", msg.chat.id, msg.id)
+        logger.info(
+            "[%s:%s] Message matches spam regex, banning without LLM check!", msg.chat.id, msg.id
+        )
         matching_regex = next(
             (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
         )
@@ -569,7 +573,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     if len(text) < 20:
         logger.info("[%s:%s] Short message, skipping LLM check!", msg.chat.id, msg.id)
         return True
-    
+
     # For other messages, run the LLM check and then process them in the after function.
     # Allow admins to override the purpose.
     logger.info("[%s:%s] LLM checking message...", msg.chat.id, msg.id)
@@ -609,6 +613,7 @@ async def attempt_delete_ban(
     Attempt to delete the message and ban the sender, and forward the message to the monitor chat with the reasoning.
     """
     sender = cast(User, msg.from_user)
+    caller = msg.guest_bot_caller_user
     monitor = sender.id if sender.id in effective_admins() else cfg.chats.monitor
 
     fwd_msg = None
@@ -620,7 +625,11 @@ async def attempt_delete_ban(
 
     no_delete = ""
     no_ban = ""
-    if sender.id in effective_admins() or msg.chat.id not in effective_moderated_chats():
+    if (
+        sender.id in effective_admins()
+        or (caller and caller.id in effective_admins())
+        or msg.chat.id not in effective_moderated_chats()
+    ):
         no_ban = "\n(simulation, would have been deleted/banned)"
     else:
         mode = chat_mode(msg.chat.id)
@@ -638,6 +647,17 @@ async def attempt_delete_ban(
                     await msg.chat.ban_member(user_id=sender.id)
                 except TelegramError as ex:
                     no_ban = f"\nFailed to ban: {ex}"
+
+    caller_ban_text = None
+    if caller and caller.id not in effective_admins():
+        caller_name = (
+            (caller.username and "@" + caller.username) or caller.full_name or str(caller.id)
+        )
+        try:
+            await msg.chat.ban_member(user_id=caller.id)
+            caller_ban_text = f"Also banned {caller_name} for calling the bot!"
+        except TelegramError as ex:
+            caller_ban_text = f"Failed to ban caller {caller_name}: {ex}"
 
     if monitor:
         user_name = (
@@ -658,6 +678,13 @@ async def attempt_delete_ban(
             chat_id=monitor,
             reply_to_message_id=fwd_msg.message_id if fwd_msg else None,
             text=text[:4095],
+        )
+
+    if monitor and caller_ban_text:
+        await bot.send_message(
+            chat_id=monitor,
+            reply_to_message_id=fwd_msg.message_id if fwd_msg else None,
+            text=caller_ban_text,
         )
 
 
