@@ -625,11 +625,12 @@ async def attempt_delete_ban(
 
     no_delete = ""
     no_ban = ""
-    if (
+    simulation = (
         sender.id in effective_admins()
         or (caller and caller.id in effective_admins())
         or msg.chat.id not in effective_moderated_chats()
-    ):
+    )
+    if simulation:
         no_ban = "\n(simulation, would have been deleted/banned)"
     else:
         mode = chat_mode(msg.chat.id)
@@ -649,15 +650,20 @@ async def attempt_delete_ban(
                     no_ban = f"\nFailed to ban: {ex}"
 
     caller_ban_text = None
-    if caller and caller.id not in effective_admins():
+    if caller:
         caller_name = (
             (caller.username and "@" + caller.username) or caller.full_name or str(caller.id)
         )
-        try:
-            await msg.chat.ban_member(user_id=caller.id)
-            caller_ban_text = f"Also banned {caller_name} for calling the bot!"
-        except TelegramError as ex:
-            caller_ban_text = f"Failed to ban caller {caller_name}: {ex}"
+        if simulation:
+            caller_ban_text = (
+                f"(simulation, would have also banned {caller_name} for calling the bot)"
+            )
+        else:
+            try:
+                await msg.chat.ban_member(user_id=caller.id)
+                caller_ban_text = f"Also banned {caller_name} for calling the bot!"
+            except TelegramError as ex:
+                caller_ban_text = f"Failed to ban caller {caller_name}: {ex}"
 
     if monitor:
         user_name = (
