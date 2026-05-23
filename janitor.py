@@ -48,7 +48,7 @@ from telegram.ext import (
 )
 
 import openrouter
-from openrouter.components import ChatResponse, ResponseFormatJSONSchema, JSONSchemaConfig
+from openrouter.components import ChatResult, ChatFormatJSONSchemaConfig, ChatJSONSchemaConfig
 
 format = "%(asctime)s [%(name)s] [%(levelname)s] %(message)s"
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format=format)
@@ -468,7 +468,7 @@ async def process_edit(bot: Bot, msg: Message):
         )
 
 
-async def llm_api(text: str, purpose: str) -> ChatResponse:
+async def llm_api(text: str, purpose: str) -> ChatResult:
     """
     Call the LLM API with the given text and purpose, and return the response.
     """
@@ -480,9 +480,9 @@ async def llm_api(text: str, purpose: str) -> ChatResponse:
         ],
         max_tokens=3000,
         temperature=0.5,
-        response_format=ResponseFormatJSONSchema(
+        response_format=ChatFormatJSONSchemaConfig(
             type="json_schema",
-            json_schema=JSONSchemaConfig(
+            json_schema=ChatJSONSchemaConfig(
                 name="spam_prob",
                 strict=True,
                 schema_={
