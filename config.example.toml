@@ -29,6 +29,19 @@ monitor = -1001234567890
 # If any pattern matches, the message is considered spam without consulting the AI.
 regex = ["spammy phrase 1"]
 
+# Treat forwarded stories as spam (their contents are not visible via the API).
+forwarded_story = true
+
+# Treat messages forwarded from a channel that contain an inline keyboard as spam.
+channel_forwarded_with_keyboard = true
+
+# Treat messages forwarded from a channel that contain both Cyrillic text and a
+# suspicious link (matched by suspicious_link_regex) as spam.
+channel_forwarded_cyrillic_and_links = true
+
+# Link pattern used by the channel_forwarded_cyrillic_and_links check.
+suspicious_link_regex = '@\w+|https?://t\.me|https?://vk\.'
+
 [llm]
 # OpenRouter API key and model name for spam detection.
 openrouter_key = "FILLME"
@@ -41,6 +54,10 @@ retry_delay = 1.0
 # Number of times to retry the LLM API call after a timeout or other error.
 # If all retries fail, the message is not considered spam.
 retry_count = 3
+
+# Minimum message length (characters) required before consulting the AI.
+# Shorter messages skip the LLM call and are assumed not to be spam.
+min_length = 20
 
 # System prompt for the AI-based spam detection.
 # {purpose} will be replaced with the chat's purpose from the [purposes] section.

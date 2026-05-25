@@ -76,6 +76,10 @@ class ChatsConfig(BaseModel):
 
 class SpamConfig(BaseModel):
     regex: list[str]
+    forwarded_story: bool = True
+    channel_forwarded_with_keyboard: bool = True
+    channel_forwarded_cyrillic_and_links: bool = True
+    suspicious_link_regex: str = r"@\w+|https?://t\.me|https?://vk\."
 
 
 class LLMConfig(BaseModel):
@@ -84,6 +88,7 @@ class LLMConfig(BaseModel):
     timeout: float = 15.0
     retry_delay: float = 1.0
     retry_count: int = 2
+    min_length: int = 20
     system_prompt: str
     threshold: float
     chat_purposes: dict[str, str]
@@ -325,26 +330,29 @@ async def process_message(bot: Bot, msg: Message):
     text, has_media, _ = parse_message(msg)
 
     # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
-    fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
-    if (
-        msg.chat.id in effective_moderated_chats()
-        and fwd_from_channel
-        and (
-            # Forwarded from channel with inline keyboard
-            msg.reply_markup
-            # Forwarded from channel, contains a link to VK or Telegram, and contains Cyrillic
-            or (
-                text
-                and re.search(r"@\w+|https?://t\.me|https?://vk\.", text)
-                and re.search(r"[\u0400-\u052F]", text, re.I)
-            )
-        )
-    ):
-        reason = "inline keyboard" if msg.reply_markup else "Cyrillic and suspicious links"
-        await attempt_delete_ban(
-            bot, msg, reasoning=f"Forwarded message from channel with {reason}"
-        )
+    if msg.chat.id in effective_moderated_chats() and msg.story and cfg.spam.forwarded_story:
+        await attempt_delete_ban(bot, msg, reasoning="Forwarded story")
         return
+
+    fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
+    if msg.chat.id in effective_moderated_chats() and fwd_from_channel:
+        if cfg.spam.channel_forwarded_with_keyboard and msg.reply_markup:
+            await attempt_delete_ban(
+                bot, msg, reasoning="Forwarded message from channel with inline keyboard"
+            )
+            return
+        if (
+            cfg.spam.channel_forwarded_cyrillic_and_links
+            and text
+            and re.search(cfg.spam.suspicious_link_regex, text)
+            and re.search(r"[\u0400-\u052F]", text, re.I)
+        ):
+            await attempt_delete_ban(
+                bot,
+                msg,
+                reasoning="Forwarded message from channel with Cyrillic and suspicious links",
+            )
+            return
 
     # Check for spam and react to it. If the message is likely spam, don't process it further.
     if not await check_spam(bot, msg):
@@ -581,7 +589,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # Short-circuit the LLM check for short messages, as they are unlikely to be spam
     # and it's not worth the cost to check them.
-    if len(text) < 20:
+    if len(text) < cfg.llm.min_length:
         logger.info("[%s:%s] Short message, skipping LLM check!", msg.chat.id, msg.id)
         return True
 
