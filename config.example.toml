@@ -29,7 +29,8 @@ monitor = -1001234567890
 # If any pattern matches, the message is considered spam without consulting the AI.
 regex = ["spammy phrase 1"]
 
-# Treat forwarded stories as spam (their contents are not visible via the API).
+# Treat forwarded stories from other users as spam (their contents are not visible via the API).
+# Users sharing their own story are not affected.
 forwarded_story = true
 
 # Treat messages forwarded from a channel that contain an inline keyboard as spam.

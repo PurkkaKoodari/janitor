@@ -330,7 +330,12 @@ async def process_message(bot: Bot, msg: Message):
     text, has_media, _ = parse_message(msg)
 
     # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
-    if msg.chat.id in effective_moderated_chats() and msg.story and cfg.spam.forwarded_story:
+    if (
+        cfg.spam.forwarded_story
+        and msg.chat.id in effective_moderated_chats()
+        and msg.story
+        and msg.story.chat.id != sender.id
+    ):
         await attempt_delete_ban(bot, msg, reasoning="Forwarded story")
         return
 
