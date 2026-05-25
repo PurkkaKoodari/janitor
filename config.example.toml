@@ -45,7 +45,7 @@ retry_count = 3
 # System prompt for the AI-based spam detection.
 # {purpose} will be replaced with the chat's purpose from the [purposes] section.
 # The AI should output a probability between 0.0 and 1.0 that the message is spam.
-system_prompt = """You are a moderator for a chat group where {purpose}. Your task is to determine whether the user's message is spam.
+system_prompt = """You are a moderator for a chat group where {purpose}. Your task is to determine whether the user's message is spam. {media}
 
 Almost always spam:
 - Remote job offers with few details and high pay

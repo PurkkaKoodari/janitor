@@ -241,15 +241,20 @@ def parse_chat_id(s: str) -> int | None:
         return None
 
 
-def parse_message(msg: Message) -> tuple[str, bool]:
-    has_media = (
-        bool(msg.photo)
-        or msg.document is not None
-        or msg.video is not None
-        or msg.video_note is not None
-    )
+def parse_message(msg: Message) -> tuple[str, bool, str]:
+    """Return (text, has_media, media_type) for the message."""
+    attachment = msg.effective_attachment
+    if attachment is None:
+        media_type = ""
+    elif isinstance(attachment, list):  # photo → list[PhotoSize]
+        media_type = "photo"
+    elif msg.video_note is not None:  # VideoNote → "videonote"
+        media_type = "video note"
+    else:
+        media_type = type(attachment).__name__.lower()
+    has_media = bool(media_type)
     text = msg.text or msg.caption or ""
-    return text, has_media
+    return text, has_media, media_type
 
 
 def matches(rule: Rule, has_media: bool, text: str) -> bool:
@@ -317,7 +322,7 @@ async def process_message(bot: Bot, msg: Message):
         # Ignore messages from unknown chats.
         return
 
-    text, has_media = parse_message(msg)
+    text, has_media, _ = parse_message(msg)
 
     # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
@@ -442,7 +447,7 @@ async def process_edit(bot: Bot, msg: Message):
     if not row:
         return
 
-    text, has_media = parse_message(msg)
+    text, has_media, _ = parse_message(msg)
 
     # If the message now matches an ignore rule with delete=True, delete it from the channel.
     if any(rule.delete and matches(rule, has_media, text) for rule in cfg.channel_ignore.rules):
@@ -468,14 +473,18 @@ async def process_edit(bot: Bot, msg: Message):
         )
 
 
-async def llm_api(text: str, purpose: str) -> ChatResult:
+async def llm_api(text: str, purpose: str, *, media_type: str = "") -> ChatResult:
     """
     Call the LLM API with the given text and purpose, and return the response.
     """
+    media = f"Note that the user's message also contains a {media_type}." if media_type else ""
     return await or_client.chat.send_async(
         model=cfg.llm.model,
         messages=[
-            {"role": "system", "content": cfg.llm.system_prompt.format(purpose=purpose)},
+            {
+                "role": "system",
+                "content": cfg.llm.system_prompt.format(purpose=purpose, media=media),
+            },
             {"role": "user", "content": text},
         ],
         max_tokens=3000,
@@ -504,7 +513,7 @@ async def llm_api(text: str, purpose: str) -> ChatResult:
 
 
 async def llm_check(
-    key: str, text: str, purpose: str, *, retry: int = cfg.llm.retry_count
+    key: str, text: str, purpose: str, media_type: str = "", *, retry: int = cfg.llm.retry_count
 ) -> tuple[float, str]:
     """
     Check the message with the LLM and react to spam.
@@ -515,7 +524,9 @@ async def llm_check(
     usage: str | int = "?"
     content = "?"
     try:
-        response = await asyncio.wait_for(llm_api(text, purpose), timeout=cfg.llm.timeout)
+        response = await asyncio.wait_for(
+            llm_api(text, purpose, media_type=media_type), timeout=cfg.llm.timeout
+        )
         usage = int(response.usage.total_tokens) if response.usage else "?"
         content = cast(str, response.choices[0].message.content)
         prob = json.loads(content)["prob"]
@@ -537,7 +548,7 @@ async def llm_check(
         )
         if retry:
             await asyncio.sleep(cfg.llm.retry_delay)
-            return await llm_check(key, text, purpose, retry=retry - 1)
+            return await llm_check(key, text, purpose, retry=retry - 1, media_type=media_type)
         else:
             raise RuntimeError(
                 f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
@@ -555,7 +566,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     """
     chat_id = msg.chat.id
     sender = cast(User, msg.from_user)
-    text, _ = parse_message(msg)
+    text, _, media_type = parse_message(msg)
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
     if chat_id in effective_moderated_chats() and text and re.search(cfg.spam_pattern, text, re.I):
@@ -584,7 +595,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         purpose = chat_purpose(msg.chat.id)
     # Now run the LLM check and react to the result.
     try:
-        prob, reasoning = await llm_check(f"{msg.chat.id}:{msg.id}", text, purpose)
+        prob, reasoning = await llm_check(f"{msg.chat.id}:{msg.id}", text, purpose, media_type)
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning)
