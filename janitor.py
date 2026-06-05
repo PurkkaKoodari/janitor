@@ -18,6 +18,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio, json, logging, os, re, sqlite3, sys, threading, time, tomllib
+from collections.abc import Sequence
 from functools import cached_property
 from html import escape
 from typing import Any, cast, Callable, Coroutine, TypeAlias
@@ -33,11 +34,13 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     Message,
+    MessageEntity,
     ReplyParameters,
     Update,
     User,
 )
 from telegram.error import TelegramError, BadRequest
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -246,6 +249,38 @@ def parse_chat_id(s: str) -> int | None:
         return None
 
 
+def expand_links(text: str, entities: Sequence[MessageEntity]) -> str:
+    """
+    Expand hidden-URL link entities (``text_link``) in ``text`` to Markdown ``[label](url)``.
+
+    Telegram lets spammers hide a URL behind innocuous display text, so the raw message text
+    never contains the actual link. Expanding these entities surfaces the URL to both the spam
+    regexes and the LLM.
+    """
+    links = sorted(
+        (e for e in entities if e.type == MessageEntity.TEXT_LINK and e.url),
+        key=lambda e: e.offset,
+    )
+    if not links:
+        return text
+    # Entity offsets/lengths are UTF-16 code units (per the Bot API), so slice the UTF-16 encoding
+    # rather than the Python string to stay correct for emoji and other non-BMP characters.
+    utf16 = text.encode("utf-16-le")
+    parts: list[str] = []
+    last = 0
+    for entity in links:
+        start, end = entity.offset * 2, (entity.offset + entity.length) * 2
+        # Leave non-link text verbatim so the existing plain-text regexes keep matching; only
+        # escape the structural Markdown characters needed to keep the link well-formed.
+        parts.append(utf16[last:start].decode("utf-16-le"))
+        label = re.sub(r"([\\\[\]])", r"\\\1", utf16[start:end].decode("utf-16-le"))
+        url = escape_markdown(cast(str, entity.url), version=2, entity_type=MessageEntity.TEXT_LINK)
+        parts.append(f"[{label}]({url})")
+        last = end
+    parts.append(utf16[last:].decode("utf-16-le"))
+    return "".join(parts)
+
+
 def parse_message(msg: Message) -> tuple[str, bool, str]:
     """Return (text, has_media, media_type) for the message."""
     attachment = msg.effective_attachment
@@ -258,7 +293,12 @@ def parse_message(msg: Message) -> tuple[str, bool, str]:
     else:
         media_type = type(attachment).__name__.lower()
     has_media = bool(media_type)
-    text = msg.text or msg.caption or ""
+    if msg.text is not None:
+        text = expand_links(msg.text, msg.entities)
+    elif msg.caption is not None:
+        text = expand_links(msg.caption, msg.caption_entities)
+    else:
+        text = ""
     return text, has_media, media_type
 
 
