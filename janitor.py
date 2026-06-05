@@ -606,6 +606,19 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         logger.info("[%s:%s] Using custom purpose from admin: %s", msg.chat.id, msg.id, purpose)
     else:
         purpose = chat_purpose(msg.chat.id)
+
+    if sender.id in effective_admins() and text.startswith("debug:\n"):
+        text = text[len("debug:\n") :]
+        media = f"Note that the user's message also contains a {media_type}." if media_type else ""
+        system_prompt = cfg.llm.system_prompt.format(purpose=purpose, media=media)
+        logger.info("[%s:%s] Debug mode, sending system prompt to admin.", msg.chat.id, msg.id)
+        await bot.send_message(
+            chat_id=sender.id,
+            reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
+            text=f"System prompt:\n{system_prompt}\n\nMessage:\n{text}"[:4095],
+        )
+        return True
+
     # Now run the LLM check and react to the result.
     try:
         prob, reasoning = await llm_check(f"{msg.chat.id}:{msg.id}", text, purpose, media_type)
