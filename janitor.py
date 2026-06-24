@@ -299,6 +299,10 @@ def parse_message(msg: Message) -> tuple[str, bool, str]:
         text = expand_links(msg.caption, msg.caption_entities)
     else:
         text = ""
+    # Spammers can hide a URL in the link preview instead of the text, so append it if missing.
+    preview = msg.link_preview_options
+    if preview and preview.url and str(preview.url) not in text:
+        text += f"\n{preview.url}"
     return text, has_media, media_type
 
 
