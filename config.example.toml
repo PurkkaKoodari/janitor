@@ -104,8 +104,13 @@ threshold = 0.9
 # or equal to threshold to only avoid false positives.
 multisample_threshold = 0.25
 # multisample_count should be odd to avoid ties.
-# Set to 0 to disable multisampling.
+# Set to 0 or 1 to disable multisampling.
 multisample_count = 3
+
+# Outlier threshold for debugging. If debug is true, the bot will send the super
+# admin a message if samples are more than outlier_threshold away from the median.
+# Set to 1.0 to disable outlier detection.
+outlier_threshold = 0.2
 
 # Map chat IDs (as strings) to a description of each chat's purpose.
 # The default key is used as the fallback.

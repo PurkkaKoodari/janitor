@@ -97,6 +97,7 @@ class LLMConfig(BaseModel):
     threshold: float
     multisample_threshold: float = 0.25
     multisample_count: int = 0
+    outlier_threshold: float = 0.2
     chat_purposes: dict[str, str]
 
     @field_validator("openrouter_key")
@@ -582,14 +583,14 @@ async def llm_check(
     *,
     retry: int = cfg.llm.retry_count,
     recursive: bool = False,
-) -> tuple[float, str]:
+) -> tuple[float, str, list[tuple[float, str]]]:
     """
     Check the message with the LLM and react to spam.
 
     If the result reaches the multisample threshold and this is not itself a recursive
     (multisample) call, the check is repeated in parallel and the median result is used.
 
-    Returns a tuple of (spam_probability, reasoning).
+    Returns a tuple of (spam_probability, reasoning, samples).
     """
     response = None
     usage: str | int = "?"
@@ -628,6 +629,7 @@ async def llm_check(
             ) from e
 
     reasoning = response.choices[0].message.reasoning or ""
+    samples = [(prob, reasoning)]
 
     # Multisample if the probability is above the threshold and this is the initial call.
     if not recursive and cfg.llm.multisample_count >= 2 and prob >= cfg.llm.multisample_threshold:
@@ -644,7 +646,7 @@ async def llm_check(
             ),
             return_exceptions=True,
         )
-        samples = [(prob, reasoning)] + [result for result in further if isinstance(result, tuple)]
+        samples += [result[:2] for result in further if isinstance(result, tuple)]
         samples.sort(key=lambda sample: sample[0])
         prob, reasoning = samples[(len(samples) - 1) // 2]
         logger.info(
@@ -654,7 +656,7 @@ async def llm_check(
             len(samples),
         )
 
-    return (prob, reasoning)
+    return (prob, reasoning, samples)
 
 
 async def check_spam(bot: Bot, msg: Message) -> bool:
@@ -707,7 +709,9 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # Now run the LLM check and react to the result.
     try:
-        prob, reasoning = await llm_check(f"{msg.chat.id}:{msg.id}", text, purpose, media_type)
+        prob, reasoning, samples = await llm_check(
+            f"{msg.chat.id}:{msg.id}", text, purpose, media_type
+        )
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning)
@@ -719,6 +723,19 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                 reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
                 text=f"Spam probability: {prob:.2f}\nReasoning: {reasoning}"[:4095],
             )
+
+        if cfg.debug and len(samples) >= 2:
+            # Attempt to detect outliers in the sampling in case there's room for improvement in the system prompt.
+            for sample_prob, sample_reasoning in (samples[0], samples[-1]):
+                if abs(sample_prob - prob) >= cfg.llm.outlier_threshold:
+                    await bot.send_message(
+                        chat_id=cfg.admins[0],
+                        reply_parameters=ReplyParameters(
+                            chat_id=msg.chat.id, message_id=msg.message_id
+                        ),
+                        text=f"Outlier in sampling: {sample_prob:.2f} vs median {prob:.2f}\n"
+                        f"Reasoning: {sample_reasoning}"[:4095],
+                    )
         return True
     except RuntimeError as e:
         if not cfg.quiet:
