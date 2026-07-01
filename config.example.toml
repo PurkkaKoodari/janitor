@@ -92,6 +92,15 @@ Output a probability between 0.0 and 1.0 that the message is spam."""
 # Threshold above which messages are considered spam and deleted.
 threshold = 0.9
 
+# Multisampling for the LLM. If the initial evaluation reaches multisample_threshold,
+# the LLM is called a further count-1 times and the median probability is used.
+# multisample_threshold should typically be below threshold to avoid false negatives,
+# or equal to threshold to only avoid false positives.
+multisample_threshold = 0.25
+# multisample_count should be odd to avoid ties.
+# Set to 0 to disable multisampling.
+multisample_count = 3
+
 # Map chat IDs (as strings) to a description of each chat's purpose.
 # The default key is used as the fallback.
 [llm.chat_purposes]

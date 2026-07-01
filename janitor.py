@@ -95,6 +95,8 @@ class LLMConfig(BaseModel):
     min_length: int = 20
     system_prompt: str
     threshold: float
+    multisample_threshold: float = 0.25
+    multisample_count: int = 0
     chat_purposes: dict[str, str]
 
     @field_validator("openrouter_key")
@@ -571,10 +573,19 @@ async def llm_api(text: str, purpose: str, *, media_type: str = "") -> ChatResul
 
 
 async def llm_check(
-    key: str, text: str, purpose: str, media_type: str = "", *, retry: int = cfg.llm.retry_count
+    key: str,
+    text: str,
+    purpose: str,
+    media_type: str = "",
+    *,
+    retry: int = cfg.llm.retry_count,
+    recursive: bool = False,
 ) -> tuple[float, str]:
     """
     Check the message with the LLM and react to spam.
+
+    If the result reaches the multisample threshold and this is not itself a recursive
+    (multisample) call, the check is repeated in parallel and the median result is used.
 
     Returns a tuple of (spam_probability, reasoning).
     """
@@ -587,7 +598,7 @@ async def llm_check(
         )
         usage = int(response.usage.total_tokens) if response.usage else "?"
         content = cast(str, response.choices[0].message.content)
-        prob = json.loads(content)["prob"]
+        prob = cast(float, json.loads(content)["prob"])
         logger.info("[%s] LLM check complete, %s tokens, spam probability: %.2f", key, usage, prob)
     except Exception as e:
         reasoning = ""
@@ -606,13 +617,41 @@ async def llm_check(
         )
         if retry:
             await asyncio.sleep(cfg.llm.retry_delay)
-            return await llm_check(key, text, purpose, retry=retry - 1, media_type=media_type)
+            return await llm_check(
+                key, text, purpose, media_type, retry=retry - 1, recursive=recursive
+            )
         else:
             raise RuntimeError(
                 f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
             ) from e
 
     reasoning = response.choices[0].message.reasoning or ""
+
+    # Multisample if the probability is above the threshold and this is the initial call.
+    if not recursive and cfg.llm.multisample_count >= 2 and prob >= cfg.llm.multisample_threshold:
+        logger.info(
+            "[%s] Spam probability %.2f reached multisample threshold, sampling %d more time(s)...",
+            key,
+            prob,
+            cfg.llm.multisample_count - 1,
+        )
+        further = await asyncio.gather(
+            *(
+                llm_check(key, text, purpose, media_type, recursive=True)
+                for _ in range(cfg.llm.multisample_count - 1)
+            ),
+            return_exceptions=True,
+        )
+        samples = [(prob, reasoning)] + [result for result in further if isinstance(result, tuple)]
+        samples.sort(key=lambda sample: sample[0])
+        prob, reasoning = samples[(len(samples) - 1) // 2]
+        logger.info(
+            "[%s] Median spam probability: %.2f (%d sample(s))",
+            key,
+            prob,
+            len(samples),
+        )
+
     return (prob, reasoning)
 
 
