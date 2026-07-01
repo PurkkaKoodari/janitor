@@ -8,6 +8,12 @@ db_name = "janitor.db"
 # admins[0] is a super admin that can assign new admins and gets some service messages and error reports.
 admins = [123456789]
 
+# If true, the bot will spam the super admin (admins[0]) with LLM evaluations and other debug messages.
+debug = false
+
+# If true, the bot will not send even LLM errors to the super admin. For very high traffic bots.
+quiet = false
+
 # User name mentioned when unknown users message the bot: "please talk to {admin_name}".
 admin_name = "your mom"
 

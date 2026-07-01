@@ -135,6 +135,8 @@ class Config(BaseModel):
     bot_token: str
     db_name: str
     admins: list[int]
+    debug: bool = False
+    quiet: bool = False
     admin_name: str
     spam: SpamConfig
     chats: ChatsConfig
@@ -710,19 +712,21 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning)
             return False
-        # Not spam, but still send the reasoning to the admins for debugging.
-        await bot.send_message(
-            chat_id=cfg.admins[0],
-            reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-            text=f"Spam probability: {prob:.2f}\nReasoning: {reasoning}"[:4095],
-        )
+        if cfg.debug:
+            # Not spam, but still send the reasoning to the admins for debugging.
+            await bot.send_message(
+                chat_id=cfg.admins[0],
+                reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
+                text=f"Spam probability: {prob:.2f}\nReasoning: {reasoning}"[:4095],
+            )
         return True
     except RuntimeError as e:
-        await bot.send_message(
-            chat_id=cfg.admins[0],
-            reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-            text=str(e)[:4095],
-        )
+        if not cfg.quiet:
+            await bot.send_message(
+                chat_id=cfg.admins[0],
+                reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
+                text=str(e)[:4095],
+            )
         # Fail open to avoid false positives.
         return True
 
