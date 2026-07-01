@@ -88,6 +88,7 @@ class SpamConfig(BaseModel):
 class LLMConfig(BaseModel):
     openrouter_key: str
     model: str
+    temperature: float = 0.5
     timeout: float = 15.0
     retry_delay: float = 1.0
     retry_count: int = 2
@@ -545,7 +546,7 @@ async def llm_api(text: str, purpose: str, *, media_type: str = "") -> ChatResul
             {"role": "user", "content": text},
         ],
         max_tokens=3000,
-        temperature=0.5,
+        temperature=cfg.llm.temperature,
         response_format=ChatFormatJSONSchemaConfig(
             type="json_schema",
             json_schema=ChatJSONSchemaConfig(

@@ -47,6 +47,8 @@ suspicious_link_regex = '@\w+|https?://t\.me|https?://vk\.'
 # OpenRouter API key and model name for spam detection.
 openrouter_key = "FILLME"
 model = "openai/gpt-oss-20b"
+# Temperature for the LLM. Lower values make the output more consistent.
+temperature = 0.5
 
 # Timeout in seconds for the LLM API call. Timeouts cause a retry.
 timeout = 15.0
