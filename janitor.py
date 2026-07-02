@@ -659,6 +659,12 @@ async def llm_check(
     return (prob, reasoning, samples)
 
 
+def sampled_prob_range(samples: list[tuple[float, str]]) -> str:
+    if len(samples) < 2:
+        return ""
+    return f" ({samples[0][0]:.2f}\u2026{samples[-1][0]:.2f})"
+
+
 async def check_spam(bot: Bot, msg: Message) -> bool:
     """
     Check the message for spam and react to spam.
@@ -714,14 +720,15 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         )
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
-            await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning)
+            await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning, samples=samples)
             return False
         if cfg.debug:
             # Not spam, but still send the reasoning to the admins for debugging.
+            sampled = sampled_prob_range(samples)
             await bot.send_message(
                 chat_id=cfg.admins[0],
                 reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-                text=f"Spam probability: {prob:.2f}\nReasoning: {reasoning}"[:4095],
+                text=f"Spam probability: {prob:.2f}{sampled}\nReasoning: {reasoning}"[:4095],
             )
 
         if cfg.debug and len(samples) >= 2:
@@ -749,7 +756,11 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
 
 async def attempt_delete_ban(
-    bot: Bot, msg: Message, prob: float | None = None, reasoning: str | None = None
+    bot: Bot,
+    msg: Message,
+    prob: float | None = None,
+    reasoning: str | None = None,
+    samples: list[tuple[float, str]] = [],
 ):
     """
     Attempt to delete the message and ban the sender, and forward the message to the monitor chat with the reasoning.
@@ -816,9 +827,10 @@ async def attempt_delete_ban(
             or msg.chat.effective_name
             or str(msg.chat.id)
         )
+        sampled = sampled_prob_range(samples)
         text = (
             f"Posted by {user_name} in {chat_name}"
-            + (f"\nSpam probability: {prob:.2f}" if prob is not None else "")
+            + (f"\nSpam probability: {prob:.2f}{sampled}" if prob is not None else "")
             + f"{no_delete}{no_ban}"
             + (f"\nReasoning: {reasoning}" if reasoning else "")
         )
