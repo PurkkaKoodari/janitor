@@ -346,6 +346,7 @@ class _OGDescriptionParser(HTMLParser):
 
 async def fetch_tme_description(url: str) -> str:
     """Fetch the og:description meta tag of a t.me link, or "" if unavailable."""
+    logger.info("Fetching description for link: %s", url)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(url)
@@ -358,18 +359,31 @@ async def fetch_tme_description(url: str) -> str:
     return (parser.description or "").strip()
 
 
-async def build_user_message(text: str, media_info: str) -> str:
-    """Build the user message content sent to the LLM, embedding attachment info and any
+async def prepare_llm_check(text: str, media_info: str) -> str | None:
+    """Build the user message content to send to the LLM, embedding attachment info and any
     linked Telegram post description as an <attachments> tag, as described in the system
-    prompt's <message_format> section."""
+    prompt's <message_format> section.
+
+    Return None if the message has too little data to be worth checking via LLM."""
+    # A media with a description always gets forwarded to the LLM.
+    # This is checked via formatting, as any media_info usually exceeds cfg.llm.min_length.
+    force_llm = "\n\n" in media_info or ":" in media_info
+
     tme_link = TME_LINK_REGEX.search(text)
     if tme_link:
         description = await fetch_tme_description(tme_link.group())
         if description:
             media_info = f"{media_info}\n\nThe message contains a Telegram link with the description:\n\n{description}".strip()
+            # A Telegram link with a description always gets forwarded to the LLM.
+            force_llm = True
 
     if media_info:
         media_info = f"<attachments>{media_info}</attachments>"
+
+    # Short-circuit the LLM check for short messages, as they are unlikely to be spam
+    # and it's not worth the cost and false positives to check them.
+    if len(text) < cfg.llm.min_length and not force_llm:
+        return None
 
     return f"{text}\n\n{media_info}".strip()
 
@@ -742,37 +756,38 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         await attempt_delete_ban(bot, msg, reasoning=f"Matched spam regex: {matching_regex}")
         return False
 
-    # Short-circuit the LLM check for short messages, as they are unlikely to be spam
-    # and it's not worth the cost to check them.
-    if len(text) < cfg.llm.min_length:
-        logger.info("[%s:%s] Short message, skipping LLM check!", msg.chat.id, msg.id)
-        return True
-
     # For other messages, run the LLM check and then process them in the after function.
     # Allow admins to override the purpose.
-    logger.info("[%s:%s] LLM checking message...", msg.chat.id, msg.id)
     if sender.id in effective_admins() and text.startswith("purpose: ") and "\n" in text:
         purpose, _, text = text[len("purpose: ") :].partition("\n")
         logger.info("[%s:%s] Using custom purpose from admin: %s", msg.chat.id, msg.id, purpose)
     else:
         purpose = chat_purpose(msg.chat.id)
 
+    llm_user_message = await prepare_llm_check(text, media_info)
+
+    # If the message has too little data to check, skip the LLM and assume it's not spam.
+    if llm_user_message is None:
+        logger.info("[%s:%s] Short message, skipping LLM check!", msg.chat.id, msg.id)
+        return True
+
     if sender.id in effective_admins() and text.startswith("debug:\n"):
         text = text[len("debug:\n") :]
         system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
-        user_message = await build_user_message(text, media_info)
         logger.info("[%s:%s] Debug mode, sending system prompt to admin.", msg.chat.id, msg.id)
         await bot.send_message(
             chat_id=sender.id,
             reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-            text=f"System prompt:\n{system_prompt}\n\nMessage:\n{user_message}"[:4095],
+            text=f"System prompt:\n{system_prompt}\n\nMessage:\n{llm_user_message}"[:4095],
         )
         return True
 
     # Now run the LLM check and react to the result.
+    logger.info("[%s:%s] LLM checking message...", msg.chat.id, msg.id)
     try:
-        user_message = await build_user_message(text, media_info)
-        prob, reasoning, samples = await llm_check(f"{msg.chat.id}:{msg.id}", user_message, purpose)
+        prob, reasoning, samples = await llm_check(
+            f"{msg.chat.id}:{msg.id}", llm_user_message, purpose
+        )
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning, samples=samples)
