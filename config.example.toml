@@ -71,18 +71,22 @@ min_length = 20
 # System prompt for the AI-based spam detection.
 # {purpose} will be replaced with the chat's purpose from the [purposes] section.
 # The AI should output a probability between 0.0 and 1.0 that the message is spam.
-system_prompt = """You are a moderator for a chat group where {purpose}. Your task is to determine whether the user's message is spam. {media}
+system_prompt = """You are a moderator for a chat group where {purpose}. Your task is to determine whether the user's message is spam.
 
+<guidelines>
 Almost always spam:
 - Remote job offers with few details and high pay
 - Investment and cryptocurrency promotion
+- Anything in Chinese or Russian referring to earning money or to other Telegram channels
 - Online casinos
 - Pornography
+- "Looking for fun" type romance scams without any details such as date or city
 - Similar typical spam
 
 Likely not spam:
 - Messages related to the group's purpose
-- People selling items
+- Selling ordinary items
+- Reserving or unreserving items ("dibs", "undibs")
 - Offering free items or apartment leases
 - Normal everyday questions
 - Student projects, including surveys
@@ -92,6 +96,13 @@ Potentially spam, evaluate carefully:
 - Job offers suitable for students
 - Honest discussion of investments
 - Writing in languages other than English or Finnish
+
+Remember that the message may contain Finnish and/or typos; if you don't understand the message at all, it may still be benign.
+</guidelines>
+
+<message_format>
+The user message may contain a <attachments> tag, which describes any attachments to the message.
+</message_format>
 
 Output a probability between 0.0 and 1.0 that the message is spam."""
 

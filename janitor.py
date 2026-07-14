@@ -21,8 +21,10 @@ import asyncio, json, logging, os, re, sqlite3, sys, threading, time, tomllib
 from collections.abc import Sequence
 from functools import cached_property
 from html import escape
+from html.parser import HTMLParser
 from typing import Any, cast, Callable, Coroutine, TypeAlias
 
+import httpx
 from pydantic import BaseModel, computed_field, field_validator
 
 from telegram import (
@@ -288,28 +290,88 @@ def expand_links(text: str, entities: Sequence[MessageEntity]) -> str:
 
 
 def parse_message(msg: Message) -> tuple[str, bool, str]:
-    """Return (text, has_media, media_type) for the message."""
-    attachment = msg.effective_attachment
-    if attachment is None:
-        media_type = ""
-    elif isinstance(attachment, list):  # photo → list[PhotoSize]
-        media_type = "photo"
-    elif msg.video_note is not None:  # VideoNote → "videonote"
-        media_type = "video note"
+    """Return (text, has_media, media_info) for the message."""
+    # Describe any attachments to the message.
+    if msg.contact is not None:  # Contact → "contact: <name>"
+        name = f"{msg.contact.first_name or ""} {msg.contact.last_name or ""}".strip()
+        media_info = (
+            f"The message contains a contact with the name:\n\n{name}"
+            if name
+            else "The message contains a contact."
+        )
+    elif msg.photo:  # photo → list[PhotoSize]
+        media_info = "The message contains a photo."
+    elif msg.video_note:  # VideoNote → "videonote"
+        media_info = "The message contains a video note."
+    elif (attachment := msg.effective_attachment) is not None:
+        media_info = f"The message contains a {type(attachment).__name__.lower()}."
     else:
-        media_type = type(attachment).__name__.lower()
-    has_media = bool(media_type)
+        media_info = ""
+
+    has_media = bool(media_info)
+
+    # Expand link entities in the message to Markdown.
     if msg.text is not None:
         text = expand_links(msg.text, msg.entities)
     elif msg.caption is not None:
         text = expand_links(msg.caption, msg.caption_entities)
     else:
         text = ""
+
     # Spammers can hide a URL in the link preview instead of the text, so append it if missing.
     preview = msg.link_preview_options
     if preview and preview.url and str(preview.url) not in text:
         text += f"\n{preview.url}"
-    return text, has_media, media_type
+
+    return text, has_media, media_info
+
+
+TME_LINK_REGEX = re.compile(r"https?://t\.me/[^\s)\]]+")
+
+
+class _OGDescriptionParser(HTMLParser):
+    """Minimal HTML parser that extracts the content of the first og:description meta tag."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.description: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "meta" or self.description is not None:
+            return
+        attrs_dict = dict(attrs)
+        if attrs_dict.get("property") == "og:description":
+            self.description = attrs_dict.get("content") or ""
+
+
+async def fetch_tme_description(url: str) -> str:
+    """Fetch the og:description meta tag of a t.me link, or "" if unavailable."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPError as e:
+        logger.warning("Failed to fetch og:description from %s: %s", url, e)
+        return ""
+    parser = _OGDescriptionParser()
+    parser.feed(response.text)
+    return (parser.description or "").strip()
+
+
+async def build_user_message(text: str, media_info: str) -> str:
+    """Build the user message content sent to the LLM, embedding attachment info and any
+    linked Telegram post description as an <attachments> tag, as described in the system
+    prompt's <message_format> section."""
+    tme_link = TME_LINK_REGEX.search(text)
+    if tme_link:
+        description = await fetch_tme_description(tme_link.group())
+        if description:
+            media_info = f"{media_info}\n\nThe message contains a Telegram link with the description:\n\n{description}".strip()
+
+    if media_info:
+        media_info = f"<attachments>{media_info}</attachments>"
+
+    return f"{text}\n\n{media_info}".strip()
 
 
 def matches(rule: Rule, has_media: bool, text: str) -> bool:
@@ -536,19 +598,18 @@ async def process_edit(bot: Bot, msg: Message):
         )
 
 
-async def llm_api(text: str, purpose: str, *, media_type: str = "") -> ChatResult:
+async def llm_api(user_message: str, purpose: str) -> ChatResult:
     """
-    Call the LLM API with the given text and purpose, and return the response.
+    Call the LLM API with the given user message and purpose, and return the response.
     """
-    media = f"Note that the user's message also contains a {media_type}." if media_type else ""
     return await or_client.chat.send_async(
         model=cfg.llm.model,
         messages=[
             {
                 "role": "system",
-                "content": cfg.llm.system_prompt.format(purpose=purpose, media=media),
+                "content": cfg.llm.system_prompt.format(purpose=purpose),
             },
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_message},
         ],
         max_tokens=3000,
         temperature=cfg.llm.temperature,
@@ -577,9 +638,8 @@ async def llm_api(text: str, purpose: str, *, media_type: str = "") -> ChatResul
 
 async def llm_check(
     key: str,
-    text: str,
+    user_message: str,
     purpose: str,
-    media_type: str = "",
     *,
     retry: int = cfg.llm.retry_count,
     recursive: bool = False,
@@ -596,9 +656,7 @@ async def llm_check(
     usage: str | int = "?"
     content = "?"
     try:
-        response = await asyncio.wait_for(
-            llm_api(text, purpose, media_type=media_type), timeout=cfg.llm.timeout
-        )
+        response = await asyncio.wait_for(llm_api(user_message, purpose), timeout=cfg.llm.timeout)
         usage = int(response.usage.total_tokens) if response.usage else "?"
         content = cast(str, response.choices[0].message.content)
         prob = cast(float, json.loads(content)["prob"])
@@ -620,9 +678,7 @@ async def llm_check(
         )
         if retry:
             await asyncio.sleep(cfg.llm.retry_delay)
-            return await llm_check(
-                key, text, purpose, media_type, retry=retry - 1, recursive=recursive
-            )
+            return await llm_check(key, user_message, purpose, retry=retry - 1, recursive=recursive)
         else:
             raise RuntimeError(
                 f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
@@ -641,7 +697,7 @@ async def llm_check(
         )
         further = await asyncio.gather(
             *(
-                llm_check(key, text, purpose, media_type, recursive=True)
+                llm_check(key, user_message, purpose, recursive=True)
                 for _ in range(cfg.llm.multisample_count - 1)
             ),
             return_exceptions=True,
@@ -673,7 +729,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     """
     chat_id = msg.chat.id
     sender = cast(User, msg.from_user)
-    text, _, media_type = parse_message(msg)
+    text, _, media_info = parse_message(msg)
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
     if chat_id in effective_moderated_chats() and text and re.search(cfg.spam_pattern, text, re.I):
@@ -703,21 +759,20 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     if sender.id in effective_admins() and text.startswith("debug:\n"):
         text = text[len("debug:\n") :]
-        media = f"Note that the user's message also contains a {media_type}." if media_type else ""
-        system_prompt = cfg.llm.system_prompt.format(purpose=purpose, media=media)
+        system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
+        user_message = await build_user_message(text, media_info)
         logger.info("[%s:%s] Debug mode, sending system prompt to admin.", msg.chat.id, msg.id)
         await bot.send_message(
             chat_id=sender.id,
             reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-            text=f"System prompt:\n{system_prompt}\n\nMessage:\n{text}"[:4095],
+            text=f"System prompt:\n{system_prompt}\n\nMessage:\n{user_message}"[:4095],
         )
         return True
 
     # Now run the LLM check and react to the result.
     try:
-        prob, reasoning, samples = await llm_check(
-            f"{msg.chat.id}:{msg.id}", text, purpose, media_type
-        )
+        user_message = await build_user_message(text, media_info)
+        prob, reasoning, samples = await llm_check(f"{msg.chat.id}:{msg.id}", user_message, purpose)
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning, samples=samples)
