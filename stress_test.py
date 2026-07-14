@@ -91,7 +91,7 @@ async def main() -> None:
             continue
 
         try:
-            prob, reasoning = await llm_check(text, purpose)
+            prob, reasoning, _ = await llm_check(text, purpose)
         except Exception as e:
             print(f"\nError on msg {msg_id}: {e}", file=sys.stderr)
             continue

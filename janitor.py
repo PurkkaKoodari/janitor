@@ -18,7 +18,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio, json, logging, os, re, sqlite3, sys, threading, time, tomllib
-from collections.abc import Sequence
+from collections.abc import Iterator, MutableMapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from html import escape
 from html.parser import HTMLParser
@@ -58,7 +60,49 @@ from openrouter.components import ChatResult, ChatFormatJSONSchemaConfig, ChatJS
 format = "%(asctime)s [%(name)s] [%(levelname)s] %(message)s"
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format=format)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("JanitorBot")
+base_logger = logging.getLogger("JanitorBot")
+
+
+class _PrefixLoggerAdapter(logging.LoggerAdapter[logging.Logger]):
+    """Logger adapter that prepends a fixed prefix to every log message."""
+
+    def __init__(self, logger: logging.Logger, prefix: str) -> None:
+        super().__init__(logger)
+        self.prefix = prefix
+
+    def process(
+        self, msg: Any, kwargs: MutableMapping[str, Any]
+    ) -> tuple[Any, MutableMapping[str, Any]]:
+        return f"{self.prefix} {msg}", kwargs
+
+
+# Holds the logger for the message currently being handled.
+_message_logger: ContextVar[_PrefixLoggerAdapter | logging.Logger] = ContextVar(
+    "message_logger", default=base_logger
+)
+
+
+@contextmanager
+def message_logging(chat_id: int, msg_id: int) -> Iterator[None]:
+    """Set a per-message logger that prepends ``[chat:msg]`` to every message logged via `logger`."""
+    adapter = _PrefixLoggerAdapter(base_logger, f"[{chat_id}:{msg_id}]")
+    token = _message_logger.set(adapter)
+    try:
+        yield
+    finally:
+        _message_logger.reset(token)
+
+
+class _LoggerProxy:
+    """Proxy forwarding to the logger set in the current context."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_message_logger.get(), name)
+
+
+# Drop-in replacement for a Logger. Inside a `message_logging` context it
+# prepends the `[chat:msg]` prefix; elsewhere it logs via the base logger.
+logger = cast(logging.Logger, _LoggerProxy())
 
 
 AfterFunc: TypeAlias = Callable[[Bot, Message], Coroutine[None, None, None]]
@@ -651,7 +695,6 @@ async def llm_api(user_message: str, purpose: str) -> ChatResult:
 
 
 async def llm_check(
-    key: str,
     user_message: str,
     purpose: str,
     *,
@@ -674,7 +717,7 @@ async def llm_check(
         usage = int(response.usage.total_tokens) if response.usage else "?"
         content = cast(str, response.choices[0].message.content)
         prob = cast(float, json.loads(content)["prob"])
-        logger.info("[%s] LLM check complete, %s tokens, spam probability: %.2f", key, usage, prob)
+        logger.info("LLM check complete, %s tokens, spam probability: %.2f", usage, prob)
     except Exception as e:
         reasoning = ""
         if response is not None:
@@ -683,8 +726,7 @@ async def llm_check(
             except Exception:
                 pass
         logger.error(
-            "[%s] LLM check failed, %s tokens, result: %s, reasoning: %s",
-            key,
+            "LLM check failed, %s tokens, result: %s, reasoning: %s",
             usage,
             content,
             reasoning,
@@ -692,7 +734,7 @@ async def llm_check(
         )
         if retry:
             await asyncio.sleep(cfg.llm.retry_delay)
-            return await llm_check(key, user_message, purpose, retry=retry - 1, recursive=recursive)
+            return await llm_check(user_message, purpose, retry=retry - 1, recursive=recursive)
         else:
             raise RuntimeError(
                 f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
@@ -704,14 +746,13 @@ async def llm_check(
     # Multisample if the probability is above the threshold and this is the initial call.
     if not recursive and cfg.llm.multisample_count >= 2 and prob >= cfg.llm.multisample_threshold:
         logger.info(
-            "[%s] Spam probability %.2f reached multisample threshold, sampling %d more time(s)...",
-            key,
+            "Spam probability %.2f reached multisample threshold, sampling %d more time(s)...",
             prob,
             cfg.llm.multisample_count - 1,
         )
         further = await asyncio.gather(
             *(
-                llm_check(key, user_message, purpose, recursive=True)
+                llm_check(user_message, purpose, recursive=True)
                 for _ in range(cfg.llm.multisample_count - 1)
             ),
             return_exceptions=True,
@@ -720,8 +761,7 @@ async def llm_check(
         samples.sort(key=lambda sample: sample[0])
         prob, reasoning = samples[(len(samples) - 1) // 2]
         logger.info(
-            "[%s] Median spam probability: %.2f (%d sample(s))",
-            key,
+            "Median spam probability: %.2f (%d sample(s))",
             prob,
             len(samples),
         )
@@ -747,9 +787,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # Handle a couple hardcoded cases of spam before even running the LLM, to save costs and reduce false negatives.
     if chat_id in effective_moderated_chats() and text and re.search(cfg.spam_pattern, text, re.I):
-        logger.info(
-            "[%s:%s] Message matches spam regex, banning without LLM check!", msg.chat.id, msg.id
-        )
+        logger.info("Message matches spam regex, banning without LLM check!")
         matching_regex = next(
             (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
         )
@@ -760,7 +798,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     # Allow admins to override the purpose.
     if sender.id in effective_admins() and text.startswith("purpose: ") and "\n" in text:
         purpose, _, text = text[len("purpose: ") :].partition("\n")
-        logger.info("[%s:%s] Using custom purpose from admin: %s", msg.chat.id, msg.id, purpose)
+        logger.info("Using custom purpose from admin: %s", purpose)
     else:
         purpose = chat_purpose(msg.chat.id)
 
@@ -768,13 +806,13 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # If the message has too little data to check, skip the LLM and assume it's not spam.
     if llm_user_message is None:
-        logger.info("[%s:%s] Short message, skipping LLM check!", msg.chat.id, msg.id)
+        logger.info("Short message, skipping LLM check!")
         return True
 
     if sender.id in effective_admins() and text.startswith("debug:\n"):
         text = text[len("debug:\n") :]
         system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
-        logger.info("[%s:%s] Debug mode, sending system prompt to admin.", msg.chat.id, msg.id)
+        logger.info("Debug mode, sending system prompt to admin.")
         await bot.send_message(
             chat_id=sender.id,
             reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
@@ -783,11 +821,9 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         return True
 
     # Now run the LLM check and react to the result.
-    logger.info("[%s:%s] LLM checking message...", msg.chat.id, msg.id)
+    logger.info("LLM checking message...")
     try:
-        prob, reasoning, samples = await llm_check(
-            f"{msg.chat.id}:{msg.id}", llm_user_message, purpose
-        )
+        prob, reasoning, samples = await llm_check(llm_user_message, purpose)
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning, samples=samples)
@@ -1217,7 +1253,8 @@ async def handle_hello(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.message)
-        asyncio.create_task(process_message(context.bot, msg))
+        with message_logging(msg.chat.id, msg.message_id):
+            asyncio.create_task(process_message(context.bot, msg))
     except Exception:
         logger.error("Error handling message", exc_info=True)
 
@@ -1225,7 +1262,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.edited_message)
-        asyncio.create_task(process_edit(context.bot, msg))
+        with message_logging(msg.chat.id, msg.message_id):
+            asyncio.create_task(process_edit(context.bot, msg))
     except Exception:
         logger.error("Error handling edited message", exc_info=True)
 
