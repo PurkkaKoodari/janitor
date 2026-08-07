@@ -113,6 +113,7 @@ def parse_message(msg: Message) -> tuple[str, bool, str]:
 
 
 TME_LINK_REGEX = re.compile(r"https?://t\.me/[^\s)\]]+")
+CJK_REGEX = re.compile(r"[\u4E00-\u9FFF]")
 
 
 class _OGDescriptionParser(HTMLParser):
@@ -162,6 +163,10 @@ async def prepare_llm_check(text: str, media_info: str) -> str | None:
             media_info = f"{media_info}\n\nThe message contains a Telegram link with the description:\n\n{description}".strip()
             # A Telegram link with a description always gets forwarded to the LLM.
             force_llm = True
+
+    # CJK spam is often very short, so always check messages containing CJK characters.
+    if CJK_REGEX.search(text):
+        force_llm = True
 
     if media_info:
         media_info = f"<attachments>{media_info}</attachments>"
