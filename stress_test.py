@@ -14,7 +14,8 @@ import sys
 import textwrap
 from typing import Any
 
-from janitor import cfg, llm_check
+from janitorbot.config import cfg
+from janitorbot.spam import llm_check
 
 
 def extract_text(text_field: str | list[str | dict[str, Any]]) -> str:

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-JanitorBot is a single-file Telegram bot (`janitor.py`) that moderates Telegram group chats using an LLM (via OpenRouter) for spam detection. It also forwards messages from "source" chats to a read-only channel for logging.
+JanitorBot is a Telegram bot that moderates Telegram group chats using an LLM (via OpenRouter) for spam detection. It also forwards messages from "source" chats to a read-only channel for logging. `janitor.py` is a thin launcher; the bot logic lives in the `janitorbot/` package.
 
 ## Commands
 
@@ -34,7 +34,18 @@ No test suite exists. `config.toml` must exist (copy from `config.example.toml`)
 
 ## Architecture
 
-The entire bot logic lives in `janitor.py`. Config, DB, and OpenRouter client are initialized at **module level** on startup.
+The bot logic lives in the `janitorbot/` package, split into focused modules. Config, DB, and OpenRouter client are initialized at **module level** on import.
+
+- `janitorbot/log.py` — logging setup and the per-message `logger` proxy
+- `janitorbot/config.py` — Pydantic config models and the `cfg` loaded from `config.toml`
+- `janitorbot/db.py` — SQLite connection, table setup, and the `effective_*` / `chat_purpose` / `chat_mode` helpers
+- `janitorbot/spam.py` — message parsing, LLM calls, spam detection, and delete/ban actions
+- `janitorbot/channel.py` — `forward_to_channel` / `edit_in_channel`: forwarding source messages (and edits) to the channel, only after spam checks pass
+- `janitorbot/commands.py` — Telegram command and callback-query handlers
+- `janitorbot/main.py` — message routing/spam-check orchestration (`process_message` / `process_edit`), the message handlers, auto-restart watcher, handler registration, `main()`
+- `janitor.py` — thin launcher (`from janitorbot.main import main`)
+
+Import chain (acyclic): `log` ← `config` ← `db` ← `spam` ← `channel` ← `commands` ← `main`. Module-level side effects (load `cfg`, open DB, build `or_client`) fire in that order.
 
 ### Chat roles
 
@@ -58,7 +69,7 @@ The entire bot logic lives in `janitor.py`. Config, DB, and OpenRouter client ar
    - Messages < 20 chars skip LLM
    - LLM call via OpenRouter returns `{"prob": float}` using structured JSON output
    - If `prob >= threshold`, calls `attempt_delete_ban`
-3. **Channel forwarding** (`process_message`): passes spam check → ignores rules → length heuristics → copies to channel with "See message" / "Delete this" buttons
+3. **Channel forwarding** (`forward_to_channel`, called by `process_message` once spam checks pass): ignore rules → length heuristics → copies to channel with "See message" / "Delete this" buttons
 4. The `messages` SQLite table maps channel message IDs → original message IDs + author, enabling reply threading and self-deletion
 
 ### Moderation modes (per chat, stored in DB)
@@ -69,7 +80,7 @@ The entire bot logic lives in `janitor.py`. Config, DB, and OpenRouter client ar
 
 ### Auto-restart
 
-A background daemon thread (`_watch_and_restart`) polls `janitor.py` and `config.toml` every second and calls `os.execv` to restart when either file changes.
+A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.toml`, and all `janitorbot/*.py` package files every second and calls `os.execv` to restart when any of them changes.
 
 ### SQLite schema
 
