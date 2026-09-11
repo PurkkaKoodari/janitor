@@ -30,6 +30,7 @@ from telegram.helpers import escape_markdown
 
 import openrouter
 from openrouter.components import ChatResult, ChatFormatJSONSchemaConfig, ChatJSONSchemaConfig
+from openrouter.errors import BadRequestResponseErrorData, OpenRouterError
 
 from janitorbot.config import Rule, cfg
 from janitorbot.db import (
@@ -185,6 +186,44 @@ def matches(rule: Rule, has_media: bool, text: str) -> bool:
     return bool(re.search(rule.regex, text, re.I))
 
 
+def extract_provider(e: Exception) -> str | None:
+    """
+    Extract the name of the upstream provider that caused an OpenRouter error, if available.
+
+    OpenRouter reports the provider responsible for many upstream failures (e.g. 502/503/429s
+    from the provider itself) in the ``provider_name`` key of the error's ``metadata``.
+    """
+    if not isinstance(e, OpenRouterError):
+        return None
+    data = cast(BadRequestResponseErrorData | None, getattr(e, "data", None))
+    if not data:
+        return None
+    if data.error.metadata:
+        return data.error.metadata.get("provider_name")
+    return None
+
+
+async def resolve_provider(e: Exception, response: ChatResult | None) -> str | None:
+    """
+    Determine the upstream provider responsible for a failed LLM check.
+
+    HTTP-level failures carry the provider on the exception itself (see ``extract_provider``).
+    But a provider can also return a 200 response that fails our JSON schema (e.g. a null or
+    malformed completion) -- OpenRouter doesn't treat that as an error, so no exception carries
+    the provider. In that case, look it up via the generation ID instead, so misbehaving
+    providers can still be identified and excluded via ``cfg.llm.model`` routing preferences.
+    """
+    provider = extract_provider(e)
+    if provider or response is None:
+        return provider
+    try:
+        generation = await or_client.generations.get_generation_async(id=response.id)
+        return generation.data.provider_name
+    except Exception:
+        logger.warning("Failed to look up provider for generation %s", response.id, exc_info=True)
+        return None
+
+
 async def llm_api(user_message: str, purpose: str) -> ChatResult:
     """
     Call the LLM API with the given user message and purpose, and return the response.
@@ -254,8 +293,10 @@ async def llm_check(
                 reasoning = response.choices[0].message.reasoning or ""
             except Exception:
                 pass
+        provider = await resolve_provider(e, response)
         logger.error(
-            "LLM check failed, %s tokens, result: %s, reasoning: %s",
+            "LLM check failed - provider: %s, tokens: %s, result: %s, reasoning: %s",
+            provider or "?",
             usage,
             content,
             reasoning,
@@ -265,8 +306,9 @@ async def llm_check(
             await asyncio.sleep(cfg.llm.retry_delay)
             return await llm_check(user_message, purpose, retry=retry - 1, recursive=recursive)
         else:
+            provider_info = f" ({provider})" if provider else ""
             raise RuntimeError(
-                f"Openrouter failed with {str(e)} after {usage} tokens\nReasoning: {reasoning}"
+                f"Openrouter{provider_info} failed after {usage} tokens\nError: {str(e)}\nReasoning: {reasoning}"
             ) from e
 
     reasoning = response.choices[0].message.reasoning or ""
