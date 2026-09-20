@@ -394,12 +394,13 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     # Now run the LLM check and react to the result.
     logger.info("LLM checking message...")
     try:
+        benign = True
         prob, reasoning, samples = await llm_check(llm_user_message, purpose)
         if prob >= cfg.llm.threshold:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning, samples=samples)
-            return False
-        if cfg.debug:
+            benign = False
+        elif cfg.debug:
             # Not spam, but still send the reasoning to the admins for debugging.
             sampled = sampled_prob_range(samples)
             await bot.send_message(
@@ -420,7 +421,8 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                         text=f"Outlier in sampling: {sample_prob:.2f} vs median {prob:.2f}\n"
                         f"Reasoning: {sample_reasoning}"[:4095],
                     )
-        return True
+
+        return benign
     except RuntimeError as e:
         if not cfg.quiet:
             await bot.send_message(
