@@ -364,6 +364,26 @@ def find_checks(user_id: int | None, timestamp: int, c_hash: bytes | None) -> li
     return _group_checks(map(_CheckRow._make, cursor))
 
 
+def find_mirrored_checks(channel_msg_id: int) -> list[RecordedCheck]:
+    """Return the recorded checks of the source message mirrored as the channel message."""
+    cursor.execute("SELECT orig_id, author FROM messages WHERE id = ?", [channel_msg_id])
+    row = cursor.fetchone()
+    if row is None:
+        return []
+    orig_id, author = row
+    # The messages table has no chat ID, so match on the sender in any source chat.
+    placeholders = ", ".join("?" * len(cfg.chats.source))
+    cursor.execute(
+        f"""
+        SELECT {_CHECK_COLUMNS} FROM spam_messages
+        WHERE message_id = ? AND user_id = ? AND NOT system AND chat_id IN ({placeholders})
+        ORDER BY rowid
+        """,
+        [orig_id, author, *cfg.chats.source],
+    )
+    return _group_checks(map(_CheckRow._make, cursor))
+
+
 def latest_uncached_check(
     *, c_hash: bytes, sp_hash: bytes | None = None, before: int | None = None
 ) -> RecordedCheck | None:

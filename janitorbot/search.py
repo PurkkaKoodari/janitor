@@ -20,13 +20,15 @@
 from datetime import datetime
 from typing import cast
 
-from telegram import Bot, Message, MessageOriginUser
+from telegram import Bot, Message, MessageOriginChannel, MessageOriginUser
 
 from janitorbot.commands import fetch_chat_name
+from janitorbot.config import cfg
 from janitorbot.db import (
     RecordedCheck,
     content_hash,
     find_checks,
+    find_mirrored_checks,
     latest_uncached_check,
 )
 from janitorbot.spam import parse_message, prepare_llm_check
@@ -110,27 +112,32 @@ async def search_forwarded(bot: Bot, msg: Message) -> bool:
     """
     Reply to a message forwarded by an admin with the recorded checks of the original message.
 
-    Matches on sender, send date and content, then without content in case the message was
-    edited. Returns False if nothing matched, so the message should be simulated instead.
+    Forwards from the CHANNEL are resolved to the mirrored source message. Others are matched on
+    sender, send date and content, then without content in case the message was edited. Returns
+    False if nothing matched, so the message should be simulated instead.
     """
     origin = msg.forward_origin
     assert origin is not None
-    # The sender is only known for users who allow linking forwards to their account.
-    user_id = origin.sender_user.id if isinstance(origin, MessageOriginUser) else None
-    timestamp = int(origin.date.timestamp())
     text, _, media_info = parse_message(msg)
     c_hash = await _llm_content_hash(text, media_info)
 
-    # Search with user + timestamp + content, or just the timestamp + content if user is hidden.
-    checks = find_checks(user_id, timestamp, c_hash)
-    if not checks and user_id is not None:
-        # User is visible, but no match with content hash. May be an edit we haven't seen,
-        # or perhaps a link description changed. Retry with just user + timestamp.
-        checks = find_checks(user_id, timestamp, None)
-        if checks:
-            await msg.reply_text(
-                "Original spam check not found, showing messages/edits with that user and timestamp."
-            )
+    if isinstance(origin, MessageOriginChannel) and origin.chat.id == cfg.chats.channel:
+        # The sender and date are the channel's, so only the mirrored message or content can match.
+        checks = find_mirrored_checks(origin.message_id)
+    else:
+        # The sender is only known for users who allow linking forwards to their account.
+        user_id = origin.sender_user.id if isinstance(origin, MessageOriginUser) else None
+        timestamp = int(origin.date.timestamp())
+        # Search with user + timestamp + content, or just the timestamp + content if user is hidden.
+        checks = find_checks(user_id, timestamp, c_hash)
+        if not checks and user_id is not None:
+            # User is visible, but no match with content hash. May be an edit we haven't seen,
+            # or perhaps a link description changed. Retry with just user + timestamp.
+            checks = find_checks(user_id, timestamp, None)
+            if checks:
+                await msg.reply_text(
+                    "Original spam check not found, showing messages/edits with that user and timestamp."
+                )
     if not checks:
         # No match with timestamp. Try with just the content hash, which may match a different message,
         # but still produces a "search" result rather than a simulation.
