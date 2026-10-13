@@ -34,11 +34,13 @@ from telegram.ext import (
 
 from janitorbot.channel import edit_in_channel, forward_to_channel
 from janitorbot.commands import (
+    AdminFilter,
     handle_admin,
     handle_callback_query,
     handle_chats,
     handle_deletejoins,
     handle_hello,
+    handle_help,
     handle_mode,
     handle_moderate,
     handle_purpose,
@@ -215,6 +217,8 @@ def main():
     app.add_handler(CommandHandler("deletejoins", handle_deletejoins))
     app.add_handler(CommandHandler("chats", handle_chats))
     app.add_handler(CommandHandler("hello", handle_hello))
+    # Non-admins' /help falls through to handle_message, which treats it like /start.
+    app.add_handler(CommandHandler("help", handle_help, filters=AdminFilter()))
     app.add_handler(CommandHandler("admin", handle_admin))
     app.add_handler(CommandHandler("unadmin", handle_unadmin))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, handle_message))

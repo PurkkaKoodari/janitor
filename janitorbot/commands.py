@@ -36,7 +36,7 @@ from telegram import (
     User,
 )
 from telegram.error import TelegramError
-from telegram.ext import Application, ContextTypes
+from telegram.ext import Application, ContextTypes, filters
 
 from janitorbot.channel import delete_from_channel
 from janitorbot.config import Mode, cfg
@@ -63,14 +63,27 @@ class CommandError(Exception):
     """Aborts a command, replying to the sender with the exception message."""
 
 
+class AdminFilter(filters.MessageFilter):
+    """Matches messages sent by admins."""
+
+    def filter(self, message: Message) -> bool:
+        return message.from_user is not None and message.from_user.id in effective_admins()
+
+
 type CommandCallback = Callable[[Message, User, list[str], Bot], Coroutine[Any, Any, None]]
 type CommandHandlerCallback = Callable[
     [Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]
 ]
 
 
+ADMIN_COMMANDS: list[BotCommand] = []
+SUPERADMIN_COMMANDS: list[BotCommand] = []
+COMMAND_USAGES: dict[str, str] = {}
+
+
 def command(
     name: str,
+    description: str,
     usage: str = "",
     min_args: int = 0,
     max_args: int | None = None,
@@ -80,6 +93,12 @@ def command(
     Wrap a command implementation into a handler that checks access and argument count,
     replies with `CommandError` messages and logs other errors.
     """
+
+    COMMAND_USAGES[name] = usage
+    if access == "admin":
+        ADMIN_COMMANDS.append(BotCommand(name, description))
+    if access in ("admin", "superadmin"):
+        SUPERADMIN_COMMANDS.append(BotCommand(name, description))
 
     def decorator(func: CommandCallback) -> CommandHandlerCallback:
         async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -234,22 +253,13 @@ async def warn_missing_permissions(bot: Bot, msg: Message, chat_id: int, mode: s
             )
 
 
-ADMIN_COMMANDS = [
-    BotCommand("moderate", "Enable moderation for a chat"),
-    BotCommand("unmoderate", "Remove a chat from moderated chats"),
-    BotCommand("purpose", "Show/set the LLM chat purpose for a chat"),
-    BotCommand("mode", "Show/set moderation mode for a chat (test/delete/ban)"),
-    BotCommand("deletejoins", "Show/set deletion of join/leave messages for a chat"),
-]
-SUPERADMIN_COMMANDS = ADMIN_COMMANDS + [
-    BotCommand("chats", "List all moderated chats"),
-    BotCommand("admin", "Add a user as admin"),
-    BotCommand("unadmin", "Remove a user from admins"),
-]
+def admin_commands_for(user_id: int) -> list[BotCommand]:
+    """Return the commands available to the given admin."""
+    return SUPERADMIN_COMMANDS if user_id == cfg.admins[0] else ADMIN_COMMANDS
 
 
 async def set_admin_commands(bot: Bot, user_id: int) -> None:
-    commands = SUPERADMIN_COMMANDS if user_id == cfg.admins[0] else ADMIN_COMMANDS
+    commands = admin_commands_for(user_id)
     try:
         await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=user_id))
     except TelegramError:
@@ -272,7 +282,7 @@ async def post_init(app: Application[Bot, Any, Any, Any, Any, Any]) -> None:
     app.create_task(purge_old_reasonings_loop())
 
 
-@command("moderate", "<chat_id>", min_args=1, max_args=1)
+@command("moderate", "Enable moderation for a chat", "<chat_id>", min_args=1, max_args=1)
 async def handle_moderate(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_chat_id(args[0])
     await warn_missing_permissions(bot, msg, chat_id, chat_mode(chat_id))
@@ -291,7 +301,7 @@ async def handle_moderate(msg: Message, sender: User, args: list[str], bot: Bot)
         await notify_monitor(bot, msg, sender, f"enabled moderation for chat {name.html}.")
 
 
-@command("unmoderate", "<chat_id>", min_args=1, max_args=1)
+@command("unmoderate", "Remove a chat from moderated chats", "<chat_id>", min_args=1, max_args=1)
 async def handle_unmoderate(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_chat_id(args[0])
     if chat_id in cfg.moderated_chats:
@@ -306,7 +316,12 @@ async def handle_unmoderate(msg: Message, sender: User, args: list[str], bot: Bo
     await notify_monitor(bot, msg, sender, f"removed chat {name.html} from moderated chats.")
 
 
-@command("purpose", "<chat_id> [default|purpose...]", min_args=1)
+@command(
+    "purpose",
+    "Show/set the LLM chat purpose for a chat",
+    "<chat_id> [default|purpose...]",
+    min_args=1,
+)
 async def handle_purpose(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_moderated_chat_id(args[0])
     if len(args) > 1:
@@ -331,7 +346,13 @@ async def handle_purpose(msg: Message, sender: User, args: list[str], bot: Bot) 
     )
 
 
-@command("mode", "<chat_id> [test|delete|ban|default]", min_args=1, max_args=2)
+@command(
+    "mode",
+    "Show/set moderation mode for a chat (test/delete/ban)",
+    "<chat_id> [test|delete|ban|default]",
+    min_args=1,
+    max_args=2,
+)
 async def handle_mode(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_moderated_chat_id(args[0])
     name = await fetch_chat_name(bot, chat_id)
@@ -352,7 +373,13 @@ async def handle_mode(msg: Message, sender: User, args: list[str], bot: Bot) -> 
     )
 
 
-@command("deletejoins", "<chat_id> [on|off|default]", min_args=1, max_args=2)
+@command(
+    "deletejoins",
+    "Show/set deletion of join/leave messages for a chat",
+    "<chat_id> [on|off|default]",
+    min_args=1,
+    max_args=2,
+)
 async def handle_deletejoins(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_moderated_chat_id(args[0])
     name = await fetch_chat_name(bot, chat_id)
@@ -373,7 +400,7 @@ async def handle_deletejoins(msg: Message, sender: User, args: list[str], bot: B
     )
 
 
-@command("admin", "<user_id>", min_args=1, max_args=1, access="superadmin")
+@command("admin", "Add a user as admin", "<user_id>", min_args=1, max_args=1, access="superadmin")
 async def handle_admin(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     user_id = parse_user_id(args[0])
     if user_id in cfg.admins:
@@ -385,7 +412,9 @@ async def handle_admin(msg: Message, sender: User, args: list[str], bot: Bot) ->
     await msg.reply_text(f"User {user_id} added as admin.")
 
 
-@command("unadmin", "<user_id>", min_args=1, max_args=1, access="superadmin")
+@command(
+    "unadmin", "Remove a user from admins", "<user_id>", min_args=1, max_args=1, access="superadmin"
+)
 async def handle_unadmin(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     user_id = parse_user_id(args[0])
     if user_id in cfg.admins:
@@ -432,13 +461,22 @@ def build_chats_page(page: int) -> tuple[str, InlineKeyboardMarkup | None]:
     return "\n".join(lines), keyboard
 
 
-@command("chats", access="superadmin")
+@command("chats", "List all moderated chats", access="superadmin")
 async def handle_chats(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     text, keyboard = build_chats_page(1)
     await msg.reply_text(text, reply_markup=keyboard)
 
 
-@command("hello", access="anyone")
+@command("help", "List available commands")
+async def handle_help(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
+    lines = ["Available commands:"]
+    for cmd in admin_commands_for(sender.id):
+        usage = COMMAND_USAGES.get(cmd.command, "")
+        lines.append(f"/{cmd.command} {usage}".rstrip() + f" — {cmd.description}")
+    await msg.reply_text("\n".join(lines))
+
+
+@command("hello", "Send your user ID to the bot owner", access="anyone")
 async def handle_hello(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     await bot.send_message(
         chat_id=cfg.admins[0],
