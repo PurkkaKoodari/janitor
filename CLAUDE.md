@@ -88,7 +88,7 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 
 - `messages(id, orig_id, author)` — channel msg id → source msg id + author user id
 - `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample (or a single row with `llm_sample` NULL if not LLM-checked) per message; edits add new rows, no primary key. Joins are recorded as `system` rows for each joined user. `llm_reasoning` is purged after `reasoning_retention_days`
-- `chats(id, purpose, mode)` — dynamically added moderated chats with optional LLM purpose override and moderation mode
+- `chats(id, purpose, mode, delete_join_leave)` — dynamically added moderated chats with optional LLM purpose override, moderation mode, and join/leave message deletion override (NULL = `cfg.chats.delete_join_leave`)
 - `admins(id)` — dynamically added admin user IDs
 
 ### Config structure (`config.toml`)

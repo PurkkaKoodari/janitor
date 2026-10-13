@@ -22,6 +22,7 @@ from html import escape
 from typing import cast
 
 from telegram import Bot, Message, Update, User
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -36,6 +37,7 @@ from janitorbot.commands import (
     handle_admin,
     handle_callback_query,
     handle_chats,
+    handle_deletejoins,
     handle_hello,
     handle_mode,
     handle_moderate,
@@ -45,6 +47,7 @@ from janitorbot.commands import (
 )
 from janitorbot.config import cfg
 from janitorbot.db import (
+    chat_deletes_join_leave,
     effective_admins,
     effective_member_chats,
     effective_moderated_chats,
@@ -94,9 +97,16 @@ async def process_message(bot: Bot, msg: Message):
         # Ignore messages from unknown chats.
         return
 
-    # Record joins for determining established users, but don't process them further.
-    if msg.new_chat_members:
-        record_joins(msg)
+    # Record joins for determining established users and optionally delete join/leave messages,
+    # but don't process them further.
+    if msg.new_chat_members or msg.left_chat_member:
+        if msg.new_chat_members:
+            record_joins(msg)
+        if msg.chat.id in effective_moderated_chats() and chat_deletes_join_leave(msg.chat.id):
+            try:
+                await msg.delete()
+            except TelegramError:
+                logger.warning("Failed to delete join/leave message", exc_info=True)
         return
 
     text, _, _ = parse_message(msg)
@@ -203,6 +213,7 @@ def main():
     app.add_handler(CommandHandler("moderate", handle_moderate))
     app.add_handler(CommandHandler("unmoderate", handle_unmoderate))
     app.add_handler(CommandHandler("mode", handle_mode))
+    app.add_handler(CommandHandler("deletejoins", handle_deletejoins))
     app.add_handler(CommandHandler("chats", handle_chats))
     app.add_handler(CommandHandler("hello", handle_hello))
     app.add_handler(CommandHandler("admin", handle_admin))

@@ -30,6 +30,10 @@ moderated = [-1001234567890]
 # Channel where messages deleted by the bot are forwarded for monitoring.
 monitor = -1001234567890
 
+# Delete join/leave system messages in moderated chats by default.
+# Can be overridden per chat with /deletejoins.
+delete_join_leave = false
+
 [spam]
 # Hardcoded regex patterns that indicate spam.
 # If any pattern matches, the message is considered spam without consulting the AI.

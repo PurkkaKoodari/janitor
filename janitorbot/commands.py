@@ -39,11 +39,13 @@ from telegram.ext import Application, ContextTypes
 from janitorbot.channel import delete_from_channel
 from janitorbot.config import cfg
 from janitorbot.db import (
+    chat_deletes_join_leave,
     chat_mode,
     chat_purpose,
     cursor,
     db,
     db_admins,
+    db_chat_delete_join_leave,
     db_chat_mode,
     db_chat_purposes,
     effective_admins,
@@ -68,6 +70,7 @@ ADMIN_COMMANDS = [
     BotCommand("moderate", "Enable/update moderation for a chat"),
     BotCommand("unmoderate", "Remove a chat from moderated chats"),
     BotCommand("mode", "Set moderation mode for a chat (test/delete/ban)"),
+    BotCommand("deletejoins", "Show/set deletion of join/leave messages for a chat"),
 ]
 SUPERADMIN_COMMANDS = ADMIN_COMMANDS + [
     BotCommand("chats", "List all moderated chats"),
@@ -195,6 +198,7 @@ async def handle_unmoderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("DELETE FROM chats WHERE id = ?", [chat_id])
         db.commit()
         del db_chat_purposes[chat_id]
+        db_chat_delete_join_leave.pop(chat_id, None)
         await msg.reply_text(f"Chat {chat_id} removed from moderated chats.")
         if cfg.chats.monitor and cfg.chats.monitor != msg.chat.id:
             sender_name = (
@@ -253,6 +257,56 @@ async def handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception:
         logger.error("Error handling /mode", exc_info=True)
+
+
+async def handle_deletejoins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = cast(Message, update.message)
+        sender = cast(User, msg.from_user)
+        if sender.id not in effective_admins():
+            return
+        args = context.args or []
+        if len(args) not in (1, 2):
+            await msg.reply_text("Usage: /deletejoins <chat_id> [on|off]")
+            return
+        chat_id = parse_chat_id(args[0])
+        if chat_id is None:
+            await msg.reply_text("Invalid chat ID.")
+            return
+        if chat_id not in effective_moderated_chats():
+            await msg.reply_text(f"Chat {chat_id} is not a moderated chat.")
+            return
+        if len(args) == 1:
+            state = "on" if chat_deletes_join_leave(chat_id) else "off"
+            await msg.reply_text(f"Join/leave message deletion for chat {chat_id} is {state}.")
+            return
+        if args[1] not in ("on", "off"):
+            await msg.reply_text("Invalid value, must be 'on' or 'off'.")
+            return
+        enabled = args[1] == "on"
+        cursor.execute(
+            """
+            INSERT INTO chats (id, purpose, delete_join_leave)
+            VALUES (?, NULL, ?)
+            ON CONFLICT(id) DO UPDATE
+            SET delete_join_leave = excluded.delete_join_leave
+            """,
+            [chat_id, enabled],
+        )
+        db.commit()
+        db_chat_delete_join_leave[chat_id] = enabled
+        await msg.reply_text(f"Join/leave message deletion for chat {chat_id} set to {args[1]}.")
+        if cfg.chats.monitor and cfg.chats.monitor != msg.chat.id:
+            sender_name = (
+                (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
+            )
+            await context.bot.send_message(
+                chat_id=cfg.chats.monitor,
+                text=f"{escape(sender_name)} turned join/leave message deletion <b>{args[1]}</b> for chat <code>{chat_id}</code>.",
+                parse_mode="HTML",
+            )
+    except Exception:
+        logger.error("Error handling /deletejoins", exc_info=True)
 
 
 async def handle_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):

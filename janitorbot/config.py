@@ -38,6 +38,7 @@ class ChatsConfig(BaseModel):
     channel: int
     moderated: list[int]
     monitor: int
+    delete_join_leave: bool = False
 
 
 class SpamConfig(BaseModel):

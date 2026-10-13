@@ -64,9 +64,13 @@ cursor.execute("""
     CREATE TABLE IF NOT EXISTS chats (
         id BIGINT PRIMARY KEY,
         purpose TEXT,
-        mode TEXT NOT NULL DEFAULT 'ban'
+        mode TEXT NOT NULL DEFAULT 'ban',
+        delete_join_leave BOOLEAN
     )
     """)
+cursor.execute("PRAGMA table_info(chats)")
+if "delete_join_leave" not in [_row[1] for _row in cursor.fetchall()]:
+    cursor.execute("ALTER TABLE chats ADD COLUMN delete_join_leave BOOLEAN")
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS admins (
         id BIGINT PRIMARY KEY
@@ -75,10 +79,13 @@ cursor.execute("""
 
 db_chat_purposes: dict[int, str | None] = {}
 db_chat_mode: dict[int, str] = {}
-cursor.execute("SELECT id, purpose, mode FROM chats")
+db_chat_delete_join_leave: dict[int, bool] = {}
+cursor.execute("SELECT id, purpose, mode, delete_join_leave FROM chats")
 for _row in cursor.fetchall():
     db_chat_purposes[_row[0]] = _row[1]
     db_chat_mode[_row[0]] = _row[2]
+    if _row[3] is not None:
+        db_chat_delete_join_leave[_row[0]] = bool(_row[3])
 
 db_admins: set[int] = set()
 cursor.execute("SELECT id FROM admins")
@@ -110,6 +117,11 @@ def chat_purpose(chat_id: int) -> str:
 
 def chat_mode(chat_id: int) -> str:
     return db_chat_mode.get(chat_id, "ban")
+
+
+def chat_deletes_join_leave(chat_id: int) -> bool:
+    """Return whether join/leave system messages are deleted in the chat."""
+    return db_chat_delete_join_leave.get(chat_id, cfg.chats.delete_join_leave)
 
 
 def system_prompt_hash(system_prompt: str) -> bytes:
