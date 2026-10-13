@@ -42,11 +42,13 @@ from janitorbot.db import (
     effective_admins,
     effective_moderated_chats,
     is_established_user,
-    join_message_ids,
+    is_new_user,
     mentioning_message_ids,
+    pop_mirrored_message_ids,
     recent_spam_count,
     record_message,
     system_prompt_hash,
+    user_message_ids,
 )
 from janitorbot.log import logger
 
@@ -534,7 +536,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         return True
 
 
-async def delete_messages(bot: Bot, chat_id: int, message_ids: list[int], what: str) -> None:
+async def bulk_delete(bot: Bot, chat_id: int, message_ids: list[int], what: str) -> None:
     """Delete the given messages in the chat, ignoring messages that no longer exist."""
     if not message_ids:
         return
@@ -546,12 +548,40 @@ async def delete_messages(bot: Bot, chat_id: int, message_ids: list[int], what: 
             logger.warning("Failed to delete %s", what, exc_info=True)
 
 
+async def delete_mirrors(bot: Bot, chat_id: int, message_ids: list[int]) -> None:
+    """Delete the channel mirrors of the given messages, if the chat is a source chat."""
+    if chat_id not in cfg.chats.source or not message_ids:
+        return
+    mirror_ids = pop_mirrored_message_ids(message_ids)
+    await bulk_delete(bot, cfg.chats.channel, mirror_ids, "mirrored message(s) in channel")
+
+
+async def delete_messages(bot: Bot, chat_id: int, message_ids: list[int], what: str) -> None:
+    """Delete the given messages in the chat and their channel mirrors."""
+    await bulk_delete(bot, chat_id, message_ids, what)
+    await delete_mirrors(bot, chat_id, message_ids)
+
+
 async def ban_user(bot: Bot, msg: Message, user: User) -> None:
-    """Ban the user from the message's chat and delete their join messages there."""
+    """
+    Ban the user from the message's chat and delete their join messages there, or all their
+    messages there if they are a new user.
+    """
     await msg.chat.ban_member(user_id=user.id)
-    await delete_messages(
-        bot, msg.chat.id, join_message_ids(msg.chat.id, user.id), "join message(s) of banned user"
-    )
+    if is_new_user(msg.chat.id, user.id):
+        await delete_messages(
+            bot,
+            msg.chat.id,
+            user_message_ids(msg.chat.id, user.id),
+            "message(s) of banned new user",
+        )
+    else:
+        await delete_messages(
+            bot,
+            msg.chat.id,
+            user_message_ids(msg.chat.id, user.id, joins_only=True),
+            "join message(s) of banned user",
+        )
 
 
 async def attempt_delete_ban(
@@ -593,6 +623,8 @@ async def attempt_delete_ban(
                 await msg.delete()
             except TelegramError as ex:
                 no_delete = f"\nFailed to delete: {ex}"
+            # The message may have been mirrored before being edited into spam.
+            await delete_mirrors(bot, msg.chat.id, [msg.message_id])
             if caller and sender.username:
                 # Also make sure to delete the calling messages.
                 await delete_messages(

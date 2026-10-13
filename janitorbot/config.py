@@ -61,6 +61,11 @@ class EstablishedUserConfig(BaseModel):
     ban_threshold_messages: int = 3
 
 
+class NewUserConfig(BaseModel):
+    max_days: float = 2
+    max_nonspam_messages: int = 2
+
+
 class LLMConfig(BaseModel):
     openrouter_key: str
     model: str
@@ -118,6 +123,7 @@ class Config(BaseModel):
     admin_name: str
     spam: SpamConfig
     established_user: EstablishedUserConfig = EstablishedUserConfig()
+    new_user: NewUserConfig = NewUserConfig()
     chats: ChatsConfig
     llm: LLMConfig
     channel_ignore: ChannelIgnoreConfig

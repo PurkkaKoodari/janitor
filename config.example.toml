@@ -62,13 +62,22 @@ suspicious_link_regex = '@\w+|https?://t\.me|https?://vk\.'
 [established_user]
 # A user is established if they have a recorded message (including joins) in any known chat
 # older than min_days, and at least min_nonspam_messages recorded messages not deemed spam.
+# Set min_days = inf to disable.
 min_days = 7
 min_nonspam_messages = 10
 
-# Spam from established users is only deleted, even in ban mode, unless they have sent
+# Established users are not banned, even in ban mode, unless they have sent
 # ban_threshold_messages spam messages within ban_threshold_days.
 ban_threshold_days = 1
 ban_threshold_messages = 3
+
+[new_user]
+# A user is new in a chat if they have seen joining withing the last max_days and they
+# have sent at most max_nonspam_messages messages there not deemed spam.
+# When a new user is banned, all their seen messages in the chat are deleted.
+# Set max_days = 0 to disable.
+max_days = 2
+max_nonspam_messages = 2
 
 [llm]
 # OpenRouter API key and model name for spam detection.

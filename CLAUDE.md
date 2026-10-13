@@ -93,4 +93,4 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 
 ### Config structure (`config.toml`)
 
-Key sections: `[chats]`, `[spam]`, `[established_user]`, `[llm]`, `[llm.chat_purposes]`, `[channel_ignore]`. Validated via Pydantic models at startup. `channel_ignore.rules` are regex-based ignore rules for the channel forwarding step.
+Key sections: `[chats]`, `[spam]`, `[established_user]`, `[new_user]`, `[llm]`, `[llm.chat_purposes]`, `[channel_ignore]`. Validated via Pydantic models at startup. `channel_ignore.rules` are regex-based ignore rules for the channel forwarding step.

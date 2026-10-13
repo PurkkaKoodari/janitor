@@ -286,6 +286,31 @@ def is_established_user(user_id: int) -> bool:
     )
 
 
+def is_new_user(chat_id: int, user_id: int) -> bool:
+    """
+    Return whether the user's first recorded join to the chat is at most ``max_days`` old, and
+    they have sent at most ``max_nonspam_messages`` non-system messages not deemed spam in the
+    chat. Users never seen joining are not new.
+    """
+    cursor.execute(
+        """
+        SELECT MIN(joined), COALESCE(SUM(NOT spam AND NOT system), 0) FROM (
+            SELECT
+                MIN(CASE WHEN system THEN timestamp END) AS joined,
+                MAX(spam) AS spam,
+                MAX(system) AS system
+            FROM spam_messages
+            WHERE user_id = ? AND chat_id = ?
+            GROUP BY message_id
+        )
+        """,
+        [user_id, chat_id],
+    )
+    joined, nonspam = cursor.fetchone()
+    cutoff = time.time() - cfg.new_user.max_days * 86400
+    return joined is not None and joined >= cutoff and nonspam <= cfg.new_user.max_nonspam_messages
+
+
 def recent_spam_count(user_id: int) -> int:
     """Return the number of spam messages the user has sent within ``ban_threshold_days``."""
     cursor.execute(
@@ -302,16 +327,26 @@ def recent_spam_count(user_id: int) -> int:
     return cursor.fetchone()[0]
 
 
-def join_message_ids(chat_id: int, user_id: int) -> list[int]:
-    """Return the IDs of the recorded join messages of the user in the chat."""
+def user_message_ids(chat_id: int, user_id: int, *, joins_only: bool = False) -> list[int]:
+    """Return the IDs of the recorded messages (or only join messages) of the user in the chat."""
     cursor.execute(
-        """
+        f"""
         SELECT DISTINCT message_id FROM spam_messages
-        WHERE user_id = ? AND chat_id = ? AND system
+        WHERE user_id = ? AND chat_id = ? {"AND system" if joins_only else ""}
         """,
         [user_id, chat_id],
     )
     return [row[0] for row in cursor.fetchall()]
+
+
+def pop_mirrored_message_ids(orig_ids: list[int]) -> list[int]:
+    """Remove the channel mirrors of the given source message IDs and return their IDs."""
+    placeholders = ", ".join("?" * len(orig_ids))
+    cursor.execute(f"SELECT id FROM messages WHERE orig_id IN ({placeholders})", orig_ids)
+    ids = [row[0] for row in cursor.fetchall()]
+    cursor.execute(f"DELETE FROM messages WHERE orig_id IN ({placeholders})", orig_ids)
+    db.commit()
+    return ids
 
 
 def mentioning_message_ids(chat_id: int, user_id: int, mention: str) -> list[int]:
