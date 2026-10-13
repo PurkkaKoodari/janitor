@@ -18,9 +18,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio, json, re
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import cast
-from collections.abc import Sequence
+from typing import Any, cast
 
 import httpx
 
@@ -30,7 +31,12 @@ from telegram.helpers import escape_markdown
 
 import openrouter
 from openrouter.components import ChatResult, ChatFormatJSONSchemaConfig, ChatJSONSchemaConfig
-from openrouter.errors import BadRequestResponseErrorData, OpenRouterError
+from openrouter.errors import (
+    BadRequestResponseErrorData,
+    UnauthorizedResponseError,
+    PaymentRequiredResponseError,
+    OpenRouterError,
+)
 
 from janitorbot.config import Rule, cfg
 from janitorbot.db import (
@@ -54,6 +60,12 @@ from janitorbot.db import (
 from janitorbot.log import logger
 
 or_client = openrouter.OpenRouter(api_key=cfg.llm.openrouter_key)
+
+# Errors that are generally fatal and the bot operator's fault.
+OPERATOR_ERRORS = (
+    UnauthorizedResponseError,
+    PaymentRequiredResponseError,
+)
 
 
 def expand_links(text: str, entities: Sequence[MessageEntity]) -> str:
@@ -348,12 +360,189 @@ async def llm_api(user_message: str, purpose: str) -> ChatResult:
     )
 
 
+def parse_llm_response(response: ChatResult) -> tuple[float, str, int | None]:
+    """
+    Parse the LLM response and return (probability, reasoning, usage).
+
+    This should pass for any valid responses.
+    """
+    content = cast(str, response.choices[0].message.content)
+    prob = json.loads(content)["prob"]
+    if not isinstance(prob, (float, int)):
+        raise ValueError(f"Invalid prob value: {type(prob).__name__}: {prob}")
+
+    reasoning = response.choices[0].message.reasoning or ""
+    usage = response.usage.total_tokens if response.usage else None
+
+    return float(prob), reasoning, usage
+
+
+@dataclass(eq=False)
+class LLMError(Exception):
+    """An error occurred while checking a message with the LLM."""
+
+    causes: list[Exception]
+    fatal: bool
+    is_provider_issue: bool
+    provider: str | None
+    usage: int | None
+    finish_reason: str | None
+    content: str | None
+    reasoning: str | None
+
+    def __str__(self) -> str:
+        provider_info = f" (provider: {self.provider})" if self.provider else ""
+        usage_info = f" after {self.usage} tokens" if self.usage is not None else ""
+        finish_info = f" (finish reason: {self.finish_reason})" if self.finish_reason else ""
+        result = f"LLM check{provider_info} failed{usage_info}{finish_info}"
+        for exc in self.causes:
+            result += f"\n{type(exc).__name__}: {exc}"
+        if self.content is not None:
+            result += f"\nContent: {self.content}"
+        if self.reasoning is not None:
+            result += f"\nReasoning: {self.reasoning}"
+        return result
+
+
+class DeferredLLMError(Exception):
+    """An LLM error that will be enriched asynchronously and reported once ready."""
+
+    def __init__(self, message: str, enriched: asyncio.Task[LLMError]) -> None:
+        super().__init__(message)
+        self.enriched = enriched
+
+
+async def handle_llm_error(
+    fetch: asyncio.Task[ChatResult],
+    exc: Exception,
+    fatal: bool,
+    report: Callable[[LLMError], Awaitable[None]] | None,
+) -> LLMError:
+    """
+    Handle an LLM error, reporting it to the super admin if configured.
+    """
+    # The successful response.
+    response: ChatResult | None = None
+    # All errors to be reported on this request.
+    errors: list[Exception] = []
+    # The exception that might be an OpenRouterError with provider info.
+    err_response = exc
+    if isinstance(exc, TimeoutError):
+        # Timeout. Ditch the original stack trace, those are ugly with asyncio.
+        exc = TimeoutError(
+            f"LLM check timed out after {cfg.llm.timeout} seconds "
+            f"- slow provider or too low max tokens?"
+        )
+        try:
+            # Wait a while longer to get a response.
+            response = await asyncio.wait_for(fetch, timeout=20 * cfg.llm.timeout)
+            parse_llm_response(response)
+        except httpx.HTTPError as later_exc:
+            # The fetch failed on the HTTP layer. Ignore the timeout which is likely a side effect.
+            errors = [later_exc]
+        except TimeoutError:
+            # Timed out even with the longer wait. Report that as a provider issue.
+            errors = [
+                TimeoutError(
+                    f"LLM check timed out, no response within {20 * cfg.llm.timeout} seconds "
+                    f"- slow provider or too low max tokens?"
+                )
+            ]
+        except Exception as later_exc:
+            # The fetch or parse failed for some reason other than a timeout.
+            # Report both the timeout and that error.
+            errors = [exc, later_exc]
+            err_response = later_exc
+        else:
+            # The result was valid but came in way too late.
+            # Only report the timeout and hope that a retry or another multisample handled it.
+            errors = [exc]
+    else:
+        # The fetch or parsing didn't time out and returned another error in exc.
+        errors = [exc]
+        # Try getting the response for extra info if we have one.
+        try:
+            response = fetch.result()
+        except Exception:
+            # The fetch failed, exception is already in exc.
+            pass
+
+    # If fetch failed on the HTTP layer, that may be a network or OpenRouter issue.
+    # Log these and obvious operator problems, but don't report as a provider issue.
+    is_provider_issue = not all(
+        isinstance(e, httpx.HTTPError) or isinstance(e, OPERATOR_ERRORS) for e in errors
+    )
+
+    # Attempt to extract as much useful information as possible.
+    usage = None
+    finish_reason = None
+    content = None
+    reasoning = None
+    provider = await resolve_provider(err_response, response)
+    if response is not None:
+        try:
+            if response.usage:
+                usage = response.usage.total_tokens
+            if response.choices:
+                first = response.choices[0]
+                reasoning = first.message.reasoning or None
+                finish_reason = first.finish_reason
+                if isinstance(first.message.content, str):
+                    content = first.message.content
+                elif first.message.content is not None:
+                    content = first.message.model_dump_json(
+                        exclude={"reasoning", "reasoning_details"} if reasoning else None
+                    )
+        except Exception:
+            logger.warning("Failed to extract info from LLM response", exc_info=True)
+
+    error = LLMError(
+        causes=errors,
+        fatal=fatal,
+        is_provider_issue=is_provider_issue,
+        provider=provider,
+        usage=usage,
+        finish_reason=finish_reason,
+        content=content,
+        reasoning=reasoning,
+    )
+    error.__cause__ = exc
+    logger.error("LLM error occurred", exc_info=error)
+    if callable(report):
+        try:
+            await report(error)
+        except Exception:
+            logger.error("Error reporting LLM error", exc_info=True)
+    return error
+
+
+_error_handling_tasks = set[asyncio.Task[Any]]()
+
+
+def handle_llm_error_async(
+    fetch: asyncio.Task[ChatResult],
+    exc: Exception,
+    fatal: bool,
+    report: Callable[[LLMError], Awaitable[None]] | None,
+) -> asyncio.Task[LLMError]:
+    """
+    Handle an LLM error asynchronously, reporting it to the super admin if configured.
+
+    This is a fire-and-forget wrapper around ``handle_llm_error`` that runs in the background.
+    """
+    handle = asyncio.create_task(handle_llm_error(fetch, exc, fatal=fatal, report=report))
+    _error_handling_tasks.add(handle)
+    handle.add_done_callback(_error_handling_tasks.remove)
+    return handle
+
+
 async def llm_check(
     user_message: str,
     purpose: str,
     *,
     retry: int = cfg.llm.retry_count,
     recursive: bool = False,
+    report_error: Callable[[LLMError], Awaitable[None]] | None = None,
 ) -> tuple[float, str, list[tuple[float, str]]]:
     """
     Check the message with the LLM and react to spam.
@@ -363,41 +552,39 @@ async def llm_check(
 
     Returns a tuple of (spam_probability, reasoning, samples).
     """
-    response = None
-    usage: str | int = "?"
-    content = "?"
+    # Wrap the call in a task so we can await it multiple times.
+    task = asyncio.create_task(llm_api(user_message, purpose))
     try:
-        response = await asyncio.wait_for(llm_api(user_message, purpose), timeout=cfg.llm.timeout)
-        usage = int(response.usage.total_tokens) if response.usage else "?"
-        content = cast(str, response.choices[0].message.content)
-        prob = cast(float, json.loads(content)["prob"])
-        logger.info("LLM check complete, %s tokens, spam probability: %.2f", usage, prob)
-    except Exception as e:
-        reasoning = ""
-        if response is not None:
-            try:
-                reasoning = response.choices[0].message.reasoning or ""
-            except Exception:
-                pass
-        provider = await resolve_provider(e, response)
-        logger.error(
-            "LLM check failed - provider: %s, tokens: %s, result: %s, reasoning: %s",
-            provider or "?",
-            usage,
-            content,
-            reasoning,
-            exc_info=True,
+        response = await asyncio.wait_for(asyncio.shield(task), timeout=cfg.llm.timeout)
+        prob, reasoning, usage = parse_llm_response(response)
+        logger.info("LLM result: %s tokens, spam probability: %.2f", usage or "?", prob)
+    except Exception as exc:
+        # If the error is obviously the operator's problem, don't bother retrying.
+        if isinstance(exc, OPERATOR_ERRORS):
+            retry = 0
+
+        # Process the error further asynchronously.
+        handle = handle_llm_error_async(
+            task, exc, fatal=not retry and not recursive, report=report_error
         )
+
         if retry:
             await asyncio.sleep(cfg.llm.retry_delay)
-            return await llm_check(user_message, purpose, retry=retry - 1, recursive=recursive)
+            return await llm_check(
+                user_message,
+                purpose,
+                retry=retry - 1,
+                recursive=recursive,
+                report_error=report_error,
+            )
         else:
-            provider_info = f" ({provider})" if provider else ""
-            raise RuntimeError(
-                f"Openrouter{provider_info} failed after {usage} tokens\nError: {str(e)}\nReasoning: {reasoning}"
-            ) from e
+            raise DeferredLLMError(f"{type(exc).__name__}: {str(exc)}", handle) from exc
 
-    reasoning = response.choices[0].message.reasoning or ""
+    # Complain if the provider returned no reasoning.
+    if cfg.llm.report_no_reasoning and not reasoning.strip():
+        exc = ValueError("No reasoning returned by OpenRouter")
+        handle_llm_error_async(task, exc, fatal=False, report=report_error)
+
     samples = [(prob, reasoning)]
 
     # Multisample if the probability is above the threshold and this is the initial call.
@@ -409,7 +596,7 @@ async def llm_check(
         )
         further = await asyncio.gather(
             *(
-                llm_check(user_message, purpose, recursive=True)
+                llm_check(user_message, purpose, recursive=True, report_error=report_error)
                 for _ in range(cfg.llm.multisample_count - 1)
             ),
             return_exceptions=True,
@@ -488,7 +675,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # Now run the LLM check and react to the result.
     try:
-        samples: Sequence[tuple[float, str | None]]
+        samples: Sequence[tuple[float, str]]
         if cached_probs:
             # Only record the reused median, not the reasoning or the individual samples.
             prob = cached_probs[(len(cached_probs) - 1) // 2]
@@ -498,12 +685,33 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
             reasoning = "Cached LLM verdict from previous message"
             logger.info("Using cached verdict, spam probability: %.2f", prob)
         else:
+
+            async def report_error(error: LLMError) -> None:
+                # Record the error in the database.
+                if error.fatal:
+                    record_checked_message(msg, False, c_hash=c_hash, reasoning=str(error))
+                # Report to the super admin if configured.
+                if cfg.quiet:
+                    return
+                if error.fatal or (cfg.llm.report_provider_issues and error.is_provider_issue):
+                    await bot.send_message(
+                        chat_id=cfg.admins[0],
+                        reply_parameters=ReplyParameters(
+                            chat_id=msg.chat.id, message_id=msg.message_id
+                        ),
+                        text=str(error)[:4095],
+                    )
+
             logger.info("LLM checking message...")
-            prob, reasoning, samples = await llm_check(llm_user_message, purpose)
+            prob, reasoning, samples = await llm_check(
+                llm_user_message, purpose, report_error=report_error
+            )
             sample_probs = [sample[0] for sample in samples]
-        spam = prob >= cfg.llm.threshold
+
         # Store the verdict.
+        spam = prob >= cfg.llm.threshold
         record_checked_message(msg, spam, sp_hash=sp_hash, c_hash=c_hash, samples=samples)
+
         if spam:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(
@@ -522,7 +730,12 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                 text=f"Spam probability: {prob:.2f}{sampled}\nReasoning: {reasoning}"[:4095],
             )
 
-        if cfg.debug and not cached_probs and len(samples) >= 2:
+        if (
+            not cfg.quiet
+            and cfg.llm.outlier_threshold < 1.0
+            and not cached_probs
+            and len(samples) >= 2
+        ):
             # Attempt to detect outliers in the sampling in case there's room for improvement in the system prompt.
             for sample_prob, sample_reasoning in (samples[0], samples[-1]):
                 if abs(sample_prob - prob) >= cfg.llm.outlier_threshold:
@@ -536,15 +749,8 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                     )
 
         return not spam
-    except RuntimeError as e:
-        record_checked_message(msg, False, c_hash=c_hash, reasoning=str(e)[:4095])
-        if not cfg.quiet:
-            await bot.send_message(
-                chat_id=cfg.admins[0],
-                reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-                text=str(e)[:4095],
-            )
-        # Fail open to avoid false positives.
+    except DeferredLLMError:
+        # Fail open to avoid false positives. Will be reported asynchronously by report_error.
         return True
 
 

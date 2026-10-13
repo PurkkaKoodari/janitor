@@ -11,7 +11,8 @@ admins = [123456789]
 # If true, the bot will spam the super admin (admins[0]) with LLM evaluations and other debug messages.
 debug = false
 
-# If true, the bot will not send even LLM errors to the super admin. For very high traffic bots.
+# If true, the bot will not send even LLM errors or other potential problems to the super admin.
+# For very high traffic bots.
 quiet = false
 
 # User name mentioned when unknown users message the bot: "please talk to {admin_name}".
@@ -80,9 +81,13 @@ max_days = 2
 max_nonspam_messages = 2
 
 [llm]
-# OpenRouter API key and model name for spam detection.
+# OpenRouter API key for spam detection.
 openrouter_key = "FILLME"
+
+# OpenRouter LLM model to use for spam detection. See https://openrouter.ai/models for available models.
+# Make sure to disable report_no_reasoning if the model doesn't return reasoning traces.
 model = "openai/gpt-oss-20b"
+
 # Temperature for the LLM. Lower values make the output more consistent.
 temperature = 0.5
 
@@ -148,8 +153,16 @@ multisample_threshold = 0.25
 # Set to 0 or 1 to disable multisampling.
 multisample_count = 3
 
-# Outlier threshold for debugging. If debug is true, the bot will send the super
-# admin a message if samples are more than outlier_threshold away from the median.
+# If true, the bot will send the super admin a message every time the LLM provider in OpenRouter
+# causes errors, such as timing out, returning invalid JSON or returning no reasoning.
+report_provider_issues = true
+
+# Consider it a provider issue if the LLM returns no reasoning for a message.
+# Some models simply don't output reasoning; those are not recommended, though.
+report_no_reasoning = true
+
+# Outlier threshold for debugging. The bot will send the super admin a message if samples are
+# more than outlier_threshold away from the median.
 # Set to 1.0 to disable outlier detection.
 outlier_threshold = 0.2
 

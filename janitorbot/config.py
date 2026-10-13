@@ -78,6 +78,8 @@ class LLMConfig(BaseModel):
     threshold: float
     multisample_threshold: float = 0.25
     multisample_count: int = 0
+    report_provider_issues: bool = True
+    report_no_reasoning: bool = True
     outlier_threshold: float = 0.2
     chat_purposes: dict[str, str]
     reasoning_retention_days: int = 90
