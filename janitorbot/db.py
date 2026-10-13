@@ -19,6 +19,7 @@
 
 import hashlib, sqlite3, time
 from dataclasses import dataclass
+from typing import Literal
 
 from janitorbot.config import cfg
 
@@ -117,6 +118,22 @@ def chat_purpose(chat_id: int) -> str:
 
 def chat_mode(chat_id: int) -> str:
     return db_chat_mode.get(chat_id, "ban")
+
+
+def set_chat_setting(
+    chat_id: int, column: Literal["purpose", "mode", "delete_join_leave"], value: object
+) -> None:
+    """Set a column in the chats table, inserting the chat row if needed."""
+    cursor.execute(
+        f"""
+        INSERT INTO chats (id, {column})
+        VALUES (?, ?)
+        ON CONFLICT(id) DO UPDATE
+        SET {column} = excluded.{column}
+        """,
+        [chat_id, value],
+    )
+    db.commit()
 
 
 def chat_deletes_join_leave(chat_id: int) -> bool:

@@ -77,13 +77,10 @@ async def process_message(bot: Bot, msg: Message):
             await msg.chat.leave()
         elif sender.id in effective_admins():
             # Otherwise, send the chat id to the admins so they can add it to the config.
-            sender_name = (
-                (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
-            )
             monitor = cfg.chats.monitor or sender.id
             await bot.send_message(
                 chat_id=monitor,
-                text=f'{sender_name} added the bot to a new chat "{escape(msg.chat.effective_name or "")}" (ID <code>{msg.chat.id}</code>).',
+                text=f'{escape(sender.name)} added the bot to a new chat "{escape(msg.chat.effective_name or "")}" (ID <code>{msg.chat.id}</code>).',
                 parse_mode="HTML",
             )
         return

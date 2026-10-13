@@ -588,9 +588,7 @@ async def attempt_delete_ban(
 
     caller_ban_text = None
     if caller:
-        caller_name = (
-            (caller.username and "@" + caller.username) or caller.full_name or str(caller.id)
-        )
+        caller_name = caller.name
         if simulation:
             caller_ban_text = (
                 f"(simulation, would have also banned {caller_name} for calling the bot)"
@@ -603,9 +601,7 @@ async def attempt_delete_ban(
                 caller_ban_text = f"Failed to ban caller {caller_name}: {ex}"
 
     if monitor:
-        user_name = (
-            (sender.username and "@" + sender.username) or sender.full_name or str(sender.id)
-        )
+        user_name = sender.name
         chat_name = (
             (msg.chat.username and "@" + msg.chat.username)
             or msg.chat.effective_name
