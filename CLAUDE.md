@@ -74,9 +74,9 @@ Import chain (acyclic): `log` ← `config` ← `db` ← `spam` ← `channel` ←
 
 Every spam-checked message is recorded in the `spam_messages` table. LLM verdicts are cached: a message whose LLM input matches identically reuses the median of all recorded probabilities for it instead of calling the LLM.
 
-### Moderation modes (per chat, stored in DB)
+### Moderation modes (per chat, default `spam.mode`)
 
-- `ban` (default) — delete message and ban sender, unless the sender is an established user without recent repeated spam
+- `ban` — delete message and ban sender, unless the sender is an established user without recent repeated spam
 - `delete` — delete message only
 - `test` — log only, no action
 
@@ -88,7 +88,7 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 
 - `messages(id, orig_id, author)` — channel msg id → source msg id + author user id
 - `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample (or a single row with `llm_sample` NULL if not LLM-checked) per message; edits add new rows, no primary key. Joins are recorded as `system` rows for each joined user. `llm_reasoning` is purged after `reasoning_retention_days`
-- `chats(id, purpose, mode, delete_join_leave)` — dynamically added moderated chats with optional LLM purpose override, moderation mode, and join/leave message deletion override (NULL = `cfg.chats.delete_join_leave`)
+- `chats(id, purpose, mode, delete_join_leave)` — dynamically added moderated chats and per-chat setting overrides (NULL = config default); cached in memory as `db_chats`
 - `admins(id)` — dynamically added admin user IDs
 
 ### Config structure (`config.toml`)

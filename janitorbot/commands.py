@@ -20,7 +20,7 @@
 import asyncio
 from collections.abc import Callable, Coroutine, Sequence
 from html import escape
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 from telegram import (
     Bot,
@@ -38,20 +38,21 @@ from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes
 
 from janitorbot.channel import delete_from_channel
-from janitorbot.config import cfg
+from janitorbot.config import Mode, cfg
 from janitorbot.db import (
+    add_chat,
     chat_deletes_join_leave,
     chat_mode,
     chat_purpose,
+    chat_settings,
     cursor,
     db,
     db_admins,
-    db_chat_delete_join_leave,
-    db_chat_mode,
-    db_chat_purposes,
+    db_chats,
     effective_admins,
     effective_moderated_chats,
     purge_old_reasonings,
+    remove_chat,
     set_chat_setting,
 )
 from janitorbot.log import logger
@@ -148,10 +149,60 @@ async def notify_monitor(bot: Bot, msg: Message, sender: User, html: str) -> Non
         )
 
 
+def default_marker(value: object) -> str:
+    """Return " (default)" if the chat's setting value is None (not overridden), otherwise ""."""
+    return " (default)" if value is None else ""
+
+
+def describe_purpose(chat_id: int) -> str:
+    """Return the chat's purpose for display, marking it if it's not overridden for the chat."""
+    return chat_purpose(chat_id) + default_marker(chat_settings(chat_id).purpose)
+
+
+def describe_mode(chat_id: int) -> str:
+    """Return the chat's moderation mode for display, marking it if it's the default."""
+    return chat_mode(chat_id) + default_marker(chat_settings(chat_id).mode)
+
+
+def describe_delete_join_leave(chat_id: int) -> str:
+    """Return the chat's join/leave deletion state for display, marking it if it's the default."""
+    state = "on" if chat_deletes_join_leave(chat_id) else "off"
+    return state + default_marker(chat_settings(chat_id).delete_join_leave)
+
+
+async def warn_missing_permissions(bot: Bot, msg: Message, chat_id: int, mode: str) -> None:
+    """Warn the sender if the bot lacks the admin permissions needed for the moderation mode."""
+    try:
+        bot_member = await bot.get_chat_member(chat_id, bot.id)
+    except TelegramError:
+        await msg.reply_text(
+            f"Warning: could not check bot permissions in chat {chat_id} "
+            "(bot may not be a member). Moderation may not work correctly."
+        )
+        return
+    if bot_member.status not in ("administrator", "creator"):
+        await msg.reply_text(
+            f"Warning: bot is not an admin in chat {chat_id}. Moderation may not work correctly."
+        )
+    elif bot_member.status == "administrator" and mode != "test":
+        bot_member = cast(ChatMemberAdministrator, bot_member)
+        missing: list[str] = []
+        if not bot_member.can_delete_messages:
+            missing.append("delete messages")
+        if mode == "ban" and not bot_member.can_restrict_members:
+            missing.append("ban members")
+        if missing:
+            await msg.reply_text(
+                f"Warning: bot is missing permissions in chat {chat_id} for '{mode}' mode: "
+                f"{', '.join(missing)}. Moderation may not work correctly."
+            )
+
+
 ADMIN_COMMANDS = [
-    BotCommand("moderate", "Enable/update moderation for a chat"),
+    BotCommand("moderate", "Enable moderation for a chat"),
     BotCommand("unmoderate", "Remove a chat from moderated chats"),
-    BotCommand("mode", "Set moderation mode for a chat (test/delete/ban)"),
+    BotCommand("purpose", "Show/set the LLM chat purpose for a chat"),
+    BotCommand("mode", "Show/set moderation mode for a chat (test/delete/ban)"),
     BotCommand("deletejoins", "Show/set deletion of join/leave messages for a chat"),
 ]
 SUPERADMIN_COMMANDS = ADMIN_COMMANDS + [
@@ -185,48 +236,24 @@ async def post_init(app: Application[Bot, Any, Any, Any, Any, Any]) -> None:
     app.create_task(purge_old_reasonings_loop())
 
 
-@command("moderate", "<chat_id> [purpose...]", min_args=1)
+@command("moderate", "<chat_id>", min_args=1, max_args=1)
 async def handle_moderate(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_chat_id(args[0])
-    purpose: str | None = " ".join(args[1:]) or None
-    if purpose and len(purpose) > 200:
-        raise CommandError("Purpose is too long, must be at most 200 characters.")
-    try:
-        bot_member = await bot.get_chat_member(chat_id, bot.id)
-        if bot_member.status not in ("administrator", "creator"):
-            await msg.reply_text(
-                f"Warning: bot is not an admin in chat {chat_id}. "
-                "Moderation may not work correctly."
-            )
-        elif bot_member.status == "administrator":
-            bot_member = cast(ChatMemberAdministrator, bot_member)
-            missing: list[str] = []
-            if not bot_member.can_delete_messages:
-                missing.append("delete messages")
-            if not bot_member.can_restrict_members:
-                missing.append("ban members")
-            if missing:
-                await msg.reply_text(
-                    f"Warning: bot is missing permissions in chat {chat_id}: {', '.join(missing)}. "
-                    "Moderation may not work correctly."
-                )
-    except Exception:
-        await msg.reply_text(
-            f"Warning: could not check bot permissions in chat {chat_id} "
-            "(bot may not be a member). Moderation may not work correctly."
-        )
-    set_chat_setting(chat_id, "purpose", purpose)
-    db_chat_purposes[chat_id] = purpose
-    purpose_display = purpose or chat_purpose(chat_id) + " (default)"
+    await warn_missing_permissions(bot, msg, chat_id, chat_mode(chat_id))
+    already_moderated = chat_id in effective_moderated_chats()
+    if not already_moderated:
+        add_chat(chat_id)
+    status = "is already moderated" if already_moderated else "moderation enabled"
     await msg.reply_text(
-        f'Chat {chat_id} moderation enabled/updated.\nThe LLM will be told it\'s in "a chat group where {purpose_display}".'
+        f"Chat {chat_id} {status}.\n"
+        f"Mode: {describe_mode(chat_id)} (change with /mode)\n"
+        f"Purpose: {describe_purpose(chat_id)} (change with /purpose)\n"
+        f"Join/leave message deletion: {describe_delete_join_leave(chat_id)} (change with /deletejoins)"
     )
-    await notify_monitor(
-        bot,
-        msg,
-        sender,
-        f"enabled/updated moderation for chat <code>{chat_id}</code>.\nNew purpose: {escape(purpose_display)}",
-    )
+    if not already_moderated:
+        await notify_monitor(
+            bot, msg, sender, f"enabled moderation for chat <code>{chat_id}</code>."
+        )
 
 
 @command("unmoderate", "<chat_id>", min_args=1, max_args=1)
@@ -234,52 +261,78 @@ async def handle_unmoderate(msg: Message, sender: User, args: list[str], bot: Bo
     chat_id = parse_chat_id(args[0])
     if chat_id in cfg.moderated_chats:
         raise CommandError(
-            f"Chat {chat_id} is in the static config and cannot be removed via this command. Use /moderate to revert it to the default purpose instead."
+            f"Chat {chat_id} is in the static config and cannot be removed via this command."
         )
-    if chat_id not in db_chat_purposes:
+    if chat_id not in db_chats:
         raise CommandError(f"Chat {chat_id} is not in the moderated chats database.")
-    cursor.execute("DELETE FROM chats WHERE id = ?", [chat_id])
-    db.commit()
-    del db_chat_purposes[chat_id]
-    db_chat_delete_join_leave.pop(chat_id, None)
+    remove_chat(chat_id)
     await msg.reply_text(f"Chat {chat_id} removed from moderated chats.")
     await notify_monitor(
         bot, msg, sender, f"removed chat <code>{chat_id}</code> from moderated chats."
     )
 
 
-@command("mode", "<chat_id> <test|delete|ban>", min_args=2, max_args=2)
-async def handle_mode(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
+@command("purpose", "<chat_id> [default|purpose...]", min_args=1)
+async def handle_purpose(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_moderated_chat_id(args[0])
-    mode = parse_choice(args[1], ("test", "delete", "ban"), "mode")
-    set_chat_setting(chat_id, "mode", mode)
-    db_chat_mode[chat_id] = mode
-    await msg.reply_text(f"Moderation mode for chat {chat_id} set to '{mode}'.")
+    if len(args) > 1:
+        purpose: str | None = " ".join(args[1:])
+        if purpose == "default":
+            purpose = None
+        elif len(purpose) > 200:
+            raise CommandError("Purpose is too long, must be at most 200 characters.")
+        set_chat_setting(chat_id, "purpose", purpose)
+    purpose_display = describe_purpose(chat_id)
+    llm_text = f'The LLM will be told it\'s in "a chat group where {purpose_display}".'
+    if len(args) == 1:
+        await msg.reply_text(f"Purpose for chat {chat_id}: {purpose_display}\n{llm_text}")
+        return
+    await msg.reply_text(f"Purpose for chat {chat_id} updated.\n{llm_text}")
     await notify_monitor(
         bot,
         msg,
         sender,
-        f"set moderation mode to <b>{mode}</b> for chat <code>{chat_id}</code>.",
+        f"set the purpose for chat <code>{chat_id}</code> to: {escape(purpose_display)}",
     )
 
 
-@command("deletejoins", "<chat_id> [on|off]", min_args=1, max_args=2)
+@command("mode", "<chat_id> [test|delete|ban|default]", min_args=1, max_args=2)
+async def handle_mode(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
+    chat_id = parse_moderated_chat_id(args[0])
+    if len(args) == 1:
+        await msg.reply_text(f"Moderation mode for chat {chat_id} is {describe_mode(chat_id)}.")
+        await warn_missing_permissions(bot, msg, chat_id, chat_mode(chat_id))
+        return
+    choice = parse_choice(args[1], (*get_args(Mode), "default"), "mode")
+    mode = None if choice == "default" else cast(Mode, choice)
+    await warn_missing_permissions(bot, msg, chat_id, mode or cfg.spam.mode)
+    set_chat_setting(chat_id, "mode", mode)
+    await msg.reply_text(f"Moderation mode for chat {chat_id} set to {describe_mode(chat_id)}.")
+    await notify_monitor(
+        bot,
+        msg,
+        sender,
+        f"set moderation mode to <b>{escape(describe_mode(chat_id))}</b> for chat <code>{chat_id}</code>.",
+    )
+
+
+@command("deletejoins", "<chat_id> [on|off|default]", min_args=1, max_args=2)
 async def handle_deletejoins(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_moderated_chat_id(args[0])
     if len(args) == 1:
-        state = "on" if chat_deletes_join_leave(chat_id) else "off"
-        await msg.reply_text(f"Join/leave message deletion for chat {chat_id} is {state}.")
+        await msg.reply_text(
+            f"Join/leave message deletion for chat {chat_id} is {describe_delete_join_leave(chat_id)}."
+        )
         return
-    state = parse_choice(args[1], ("on", "off"), "value")
-    enabled = state == "on"
-    set_chat_setting(chat_id, "delete_join_leave", enabled)
-    db_chat_delete_join_leave[chat_id] = enabled
+    choice = parse_choice(args[1], ("on", "off", "default"), "value")
+    set_chat_setting(chat_id, "delete_join_leave", None if choice == "default" else choice == "on")
+    state = describe_delete_join_leave(chat_id)
     await msg.reply_text(f"Join/leave message deletion for chat {chat_id} set to {state}.")
     await notify_monitor(
         bot,
         msg,
         sender,
-        f"turned join/leave message deletion <b>{state}</b> for chat <code>{chat_id}</code>.",
+        f"turned join/leave message deletion <b>{escape(state)}</b> for chat <code>{chat_id}</code>.",
     )
 
 

@@ -19,6 +19,7 @@
 
 import re, tomllib
 from functools import cached_property
+from typing import Literal
 
 from pydantic import BaseModel, computed_field, field_validator
 
@@ -33,6 +34,9 @@ class Rule(BaseModel):
     delete: bool = False
 
 
+Mode = Literal["test", "delete", "ban"]
+
+
 class ChatsConfig(BaseModel):
     source: list[int]
     channel: int
@@ -43,6 +47,7 @@ class ChatsConfig(BaseModel):
 
 class SpamConfig(BaseModel):
     regex: list[str]
+    mode: Mode = "ban"
     forwarded_story: bool = True
     channel_forwarded_with_keyboard: bool = True
     channel_forwarded_cyrillic_and_links: bool = True

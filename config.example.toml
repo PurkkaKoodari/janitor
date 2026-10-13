@@ -35,6 +35,12 @@ monitor = -1001234567890
 delete_join_leave = false
 
 [spam]
+# Default moderation mode for moderated chats, can be overridden per chat with /mode.
+#   ban    – delete spam and ban the sender (unless they're an established user, see below)
+#   delete – delete spam only
+#   test   – only report spam to the monitor chat
+mode = "ban"
+
 # Hardcoded regex patterns that indicate spam.
 # If any pattern matches, the message is considered spam without consulting the AI.
 regex = ["spammy phrase 1"]

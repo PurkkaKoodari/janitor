@@ -41,6 +41,7 @@ from janitorbot.commands import (
     handle_hello,
     handle_mode,
     handle_moderate,
+    handle_purpose,
     handle_unadmin,
     handle_unmoderate,
     post_init,
@@ -209,6 +210,7 @@ def main():
     )
     app.add_handler(CommandHandler("moderate", handle_moderate))
     app.add_handler(CommandHandler("unmoderate", handle_unmoderate))
+    app.add_handler(CommandHandler("purpose", handle_purpose))
     app.add_handler(CommandHandler("mode", handle_mode))
     app.add_handler(CommandHandler("deletejoins", handle_deletejoins))
     app.add_handler(CommandHandler("chats", handle_chats))

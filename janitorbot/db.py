@@ -21,7 +21,7 @@ import hashlib, sqlite3, time
 from dataclasses import dataclass
 from typing import Literal
 
-from janitorbot.config import cfg
+from janitorbot.config import Mode, cfg
 
 db = sqlite3.connect(cfg.db_name)
 cursor = db.cursor()
@@ -61,32 +61,51 @@ cursor.execute("""
     CREATE INDEX IF NOT EXISTS spam_messages_reasoning_timestamp
     ON spam_messages (timestamp) WHERE llm_reasoning IS NOT NULL
     """)
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS chats (
+_CHATS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS {table} (
         id BIGINT PRIMARY KEY,
         purpose TEXT,
-        mode TEXT NOT NULL DEFAULT 'ban',
+        mode TEXT,
         delete_join_leave BOOLEAN
     )
-    """)
+    """
+cursor.execute(_CHATS_SCHEMA.format(table="chats"))
+# Migrate old chats tables: add delete_join_leave and allow NULL (= config default) mode.
 cursor.execute("PRAGMA table_info(chats)")
-if "delete_join_leave" not in [_row[1] for _row in cursor.fetchall()]:
-    cursor.execute("ALTER TABLE chats ADD COLUMN delete_join_leave BOOLEAN")
+_chats_columns = {_row[1]: _row for _row in cursor.fetchall()}
+if "delete_join_leave" not in _chats_columns or _chats_columns["mode"][3]:
+    _copied = "id, purpose, mode" + (
+        ", delete_join_leave" if "delete_join_leave" in _chats_columns else ""
+    )
+    cursor.execute(_CHATS_SCHEMA.format(table="chats_new"))
+    cursor.execute(f"INSERT INTO chats_new ({_copied}) SELECT {_copied} FROM chats")
+    cursor.execute("DROP TABLE chats")
+    cursor.execute("ALTER TABLE chats_new RENAME TO chats")
+    db.commit()
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS admins (
         id BIGINT PRIMARY KEY
     )
     """)
 
-db_chat_purposes: dict[int, str | None] = {}
-db_chat_mode: dict[int, str] = {}
-db_chat_delete_join_leave: dict[int, bool] = {}
+
+@dataclass
+class ChatSettings:
+    """Per-chat settings stored in the chats table. None means the config default."""
+
+    purpose: str | None = None
+    mode: Mode | None = None
+    delete_join_leave: bool | None = None
+
+
+db_chats: dict[int, ChatSettings] = {}
 cursor.execute("SELECT id, purpose, mode, delete_join_leave FROM chats")
 for _row in cursor.fetchall():
-    db_chat_purposes[_row[0]] = _row[1]
-    db_chat_mode[_row[0]] = _row[2]
-    if _row[3] is not None:
-        db_chat_delete_join_leave[_row[0]] = bool(_row[3])
+    db_chats[_row[0]] = ChatSettings(
+        purpose=_row[1],
+        mode=_row[2],
+        delete_join_leave=None if _row[3] is None else bool(_row[3]),
+    )
 
 db_admins: set[int] = set()
 cursor.execute("SELECT id FROM admins")
@@ -99,7 +118,7 @@ def effective_admins() -> frozenset[int]:
 
 
 def effective_moderated_chats() -> frozenset[int]:
-    return cfg.moderated_chats | frozenset(db_chat_purposes.keys())
+    return cfg.moderated_chats | frozenset(db_chats.keys())
 
 
 def effective_spam_checked_chats() -> frozenset[int]:
@@ -110,35 +129,63 @@ def effective_member_chats() -> frozenset[int]:
     return effective_moderated_chats() | {cfg.chats.channel}
 
 
+def chat_settings(chat_id: int) -> ChatSettings:
+    """Return the chat's setting overrides from the database (all None if there are none)."""
+    return db_chats.get(chat_id) or ChatSettings()
+
+
 def chat_purpose(chat_id: int) -> str:
-    return db_chat_purposes.get(chat_id) or cfg.llm.chat_purposes.get(
+    """Return the chat's purpose for the LLM, falling back to the config."""
+    return chat_settings(chat_id).purpose or cfg.llm.chat_purposes.get(
         str(chat_id), cfg.llm.chat_purposes["default"]
     )
 
 
-def chat_mode(chat_id: int) -> str:
-    return db_chat_mode.get(chat_id, "ban")
-
-
-def set_chat_setting(
-    chat_id: int, column: Literal["purpose", "mode", "delete_join_leave"], value: object
-) -> None:
-    """Set a column in the chats table, inserting the chat row if needed."""
-    cursor.execute(
-        f"""
-        INSERT INTO chats (id, {column})
-        VALUES (?, ?)
-        ON CONFLICT(id) DO UPDATE
-        SET {column} = excluded.{column}
-        """,
-        [chat_id, value],
-    )
-    db.commit()
+def chat_mode(chat_id: int) -> Mode:
+    """Return the chat's moderation mode, falling back to the config."""
+    return chat_settings(chat_id).mode or cfg.spam.mode
 
 
 def chat_deletes_join_leave(chat_id: int) -> bool:
     """Return whether join/leave system messages are deleted in the chat."""
-    return db_chat_delete_join_leave.get(chat_id, cfg.chats.delete_join_leave)
+    delete_join_leave = chat_settings(chat_id).delete_join_leave
+    return cfg.chats.delete_join_leave if delete_join_leave is None else delete_join_leave
+
+
+def add_chat(chat_id: int) -> None:
+    """Add a chat to the chats table with default settings, if not already present."""
+    cursor.execute("INSERT OR IGNORE INTO chats (id) VALUES (?)", [chat_id])
+    db.commit()
+    db_chats.setdefault(chat_id, ChatSettings())
+
+
+def remove_chat(chat_id: int) -> None:
+    """Remove a chat and its settings from the chats table."""
+    cursor.execute("DELETE FROM chats WHERE id = ?", [chat_id])
+    db.commit()
+    db_chats.pop(chat_id, None)
+
+
+def set_chat_setting(
+    chat_id: int, setting: Literal["purpose", "mode", "delete_join_leave"], value: object
+) -> None:
+    """
+    Set a setting (None for the config default) for a moderated chat. Chats moderated via the
+    config get a row on their first override.
+    """
+    if chat_id not in effective_moderated_chats():
+        raise ValueError(f"Chat {chat_id} is not moderated")
+    cursor.execute(
+        f"""
+        INSERT INTO chats (id, {setting})
+        VALUES (?, ?)
+        ON CONFLICT(id) DO UPDATE
+        SET {setting} = excluded.{setting}
+        """,
+        [chat_id, value],
+    )
+    db.commit()
+    setattr(db_chats.setdefault(chat_id, ChatSettings()), setting, value)
 
 
 def system_prompt_hash(system_prompt: str) -> bytes:
