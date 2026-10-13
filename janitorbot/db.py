@@ -53,6 +53,10 @@ cursor.execute("""
     ON spam_messages (content_hash, system_prompt_hash)
     """)
 cursor.execute("""
+    CREATE INDEX IF NOT EXISTS spam_messages_user
+    ON spam_messages (user_id, timestamp)
+    """)
+cursor.execute("""
     CREATE INDEX IF NOT EXISTS spam_messages_reasoning_timestamp
     ON spam_messages (timestamp) WHERE llm_reasoning IS NOT NULL
     """)
@@ -176,6 +180,46 @@ def cached_verdict(sp_hash: bytes, c_hash: bytes) -> list[float]:
         [c_hash, sp_hash],
     )
     return [row[0] for row in cursor.fetchall()]
+
+
+def is_established_user(user_id: int) -> bool:
+    """
+    Return whether the user has a recorded message older than ``min_days`` and at least
+    ``min_nonspam_messages`` recorded messages not deemed spam, across all known chats.
+    """
+    cursor.execute(
+        """
+        SELECT MIN(first), COALESCE(SUM(NOT spam), 0) FROM (
+            SELECT MIN(timestamp) AS first, MAX(spam) AS spam FROM spam_messages
+            WHERE user_id = ?
+            GROUP BY chat_id, message_id
+        )
+        """,
+        [user_id],
+    )
+    first, nonspam = cursor.fetchone()
+    cutoff = time.time() - cfg.established_user.min_days * 86400
+    return (
+        first is not None
+        and first <= cutoff
+        and nonspam >= cfg.established_user.min_nonspam_messages
+    )
+
+
+def recent_spam_count(user_id: int) -> int:
+    """Return the number of spam messages the user has sent within ``ban_threshold_days``."""
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT 1 FROM spam_messages
+            WHERE user_id = ? AND timestamp >= ?
+            GROUP BY chat_id, message_id
+            HAVING MAX(spam)
+        )
+        """,
+        [user_id, int(time.time() - cfg.established_user.ban_threshold_days * 86400)],
+    )
+    return cursor.fetchone()[0]
 
 
 def purge_old_reasonings() -> None:

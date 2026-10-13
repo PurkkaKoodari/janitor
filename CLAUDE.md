@@ -76,7 +76,7 @@ Every spam-checked message is recorded in the `spam_messages` table. LLM verdict
 
 ### Moderation modes (per chat, stored in DB)
 
-- `ban` (default) — delete message and ban sender
+- `ban` (default) — delete message and ban sender, unless the sender is an established user without recent repeated spam
 - `delete` — delete message only
 - `test` — log only, no action
 
@@ -87,10 +87,10 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 ### SQLite schema
 
 - `messages(id, orig_id, author)` — channel msg id → source msg id + author user id
-- `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample (or a single row with `llm_sample` NULL if not LLM-checked) per message; edits add new rows, no primary key. `llm_reasoning` is purged after `reasoning_retention_days`
+- `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample (or a single row with `llm_sample` NULL if not LLM-checked) per message; edits add new rows, no primary key. Joins are recorded as `system` rows for each joined user. `llm_reasoning` is purged after `reasoning_retention_days`
 - `chats(id, purpose, mode)` — dynamically added moderated chats with optional LLM purpose override and moderation mode
 - `admins(id)` — dynamically added admin user IDs
 
 ### Config structure (`config.toml`)
 
-Key sections: `[chats]`, `[spam]`, `[llm]`, `[llm.chat_purposes]`, `[channel_ignore]`. Validated via Pydantic models at startup. `channel_ignore.rules` are regex-based ignore rules for the channel forwarding step.
+Key sections: `[chats]`, `[spam]`, `[established_user]`, `[llm]`, `[llm.chat_purposes]`, `[channel_ignore]`. Validated via Pydantic models at startup. `channel_ignore.rules` are regex-based ignore rules for the channel forwarding step.

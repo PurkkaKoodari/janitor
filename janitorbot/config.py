@@ -48,6 +48,13 @@ class SpamConfig(BaseModel):
     suspicious_link_regex: str = r"@\w+|https?://t\.me|https?://vk\."
 
 
+class EstablishedUserConfig(BaseModel):
+    min_days: float = 7
+    min_nonspam_messages: int = 10
+    ban_threshold_days: float = 1
+    ban_threshold_messages: int = 3
+
+
 class LLMConfig(BaseModel):
     openrouter_key: str
     model: str
@@ -104,6 +111,7 @@ class Config(BaseModel):
     quiet: bool = False
     admin_name: str
     spam: SpamConfig
+    established_user: EstablishedUserConfig = EstablishedUserConfig()
     chats: ChatsConfig
     llm: LLMConfig
     channel_ignore: ChannelIgnoreConfig

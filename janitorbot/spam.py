@@ -41,6 +41,8 @@ from janitorbot.db import (
     content_hash,
     effective_admins,
     effective_moderated_chats,
+    is_established_user,
+    recent_spam_count,
     record_message,
     system_prompt_hash,
 )
@@ -169,6 +171,22 @@ def record_checked_message(
             llm_samples=samples,
         )
     )
+
+
+def record_joins(msg: Message) -> None:
+    """Store a join message in the database as a system message from each joined user."""
+    for member in msg.new_chat_members:
+        record_message(
+            MessageRecord(
+                chat_id=msg.chat.id,
+                message_id=msg.message_id,
+                user_id=member.id,
+                timestamp=int(msg.date.timestamp()),
+                system=True,
+                spam=False,
+                mentions=[],
+            )
+        )
 
 
 TME_LINK_REGEX = re.compile(r"https?://t\.me/[^\s)\]]+")
@@ -555,6 +573,13 @@ async def attempt_delete_ban(
                 no_delete = f"\nFailed to delete: {ex}"
             if mode != "ban":
                 no_ban = "\n(banning disabled for this chat)"
+            elif (
+                is_established_user(sender.id)
+                and recent_spam_count(sender.id) < cfg.established_user.ban_threshold_messages
+            ):
+                # TODO: Once python-telegram-bot supports ephemeral messages
+                # (bot API 10.3), send one to warn the user and contact cfg.admin_name.
+                no_ban = "\n(established user, not banned)"
             else:
                 try:
                     await msg.chat.ban_member(user_id=sender.id)

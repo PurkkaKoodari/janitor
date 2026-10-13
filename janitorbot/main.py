@@ -51,7 +51,13 @@ from janitorbot.db import (
     effective_spam_checked_chats,
 )
 from janitorbot.log import logger, message_logging
-from janitorbot.spam import attempt_delete_ban, check_spam, parse_message, record_checked_message
+from janitorbot.spam import (
+    attempt_delete_ban,
+    check_spam,
+    parse_message,
+    record_checked_message,
+    record_joins,
+)
 
 
 async def process_message(bot: Bot, msg: Message):
@@ -86,6 +92,11 @@ async def process_message(bot: Bot, msg: Message):
                 text=f"Hello! This bot is for moderating groups.\n\nPlease talk to {cfg.admin_name} if you want to use this instance.\n\nSource code: https://github.com/PurkkaKoodari/janitor",
             )
         # Ignore messages from unknown chats.
+        return
+
+    # Record joins for determining established users, but don't process them further.
+    if msg.new_chat_members:
+        record_joins(msg)
         return
 
     text, _, _ = parse_message(msg)

@@ -49,6 +49,17 @@ channel_forwarded_cyrillic_and_links = true
 # Link pattern used by the channel_forwarded_cyrillic_and_links check.
 suspicious_link_regex = '@\w+|https?://t\.me|https?://vk\.'
 
+[established_user]
+# A user is established if they have a recorded message (including joins) in any known chat
+# older than min_days, and at least min_nonspam_messages recorded messages not deemed spam.
+min_days = 7
+min_nonspam_messages = 10
+
+# Spam from established users is only deleted, even in ban mode, unless they have sent
+# ban_threshold_messages spam messages within ban_threshold_days.
+ban_threshold_days = 1
+ban_threshold_messages = 3
+
 [llm]
 # OpenRouter API key and model name for spam detection.
 openrouter_key = "FILLME"
