@@ -91,6 +91,9 @@ model = "openai/gpt-oss-20b"
 # Temperature for the LLM. Lower values make the output more consistent.
 temperature = 0.5
 
+# Reasoning effort for the LLM. Null to use the default for the model.
+reasoning_effort = "medium"
+
 # Timeout in seconds for the LLM API call. Timeouts cause a retry.
 timeout = 15.0
 # Retry delay in seconds after a timeout or other error when calling the LLM API.

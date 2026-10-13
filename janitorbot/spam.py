@@ -30,7 +30,12 @@ from telegram.error import TelegramError
 from telegram.helpers import escape_markdown
 
 import openrouter
-from openrouter.components import ChatResult, ChatFormatJSONSchemaConfig, ChatJSONSchemaConfig
+from openrouter.components import (
+    ChatResult,
+    ChatFormatJSONSchemaConfig,
+    ChatJSONSchemaConfig,
+    Reasoning,
+)
 from openrouter.errors import (
     BadRequestResponseErrorData,
     UnauthorizedResponseError,
@@ -337,6 +342,10 @@ async def llm_api(user_message: str, purpose: str) -> ChatResult:
         ],
         max_tokens=3000,
         temperature=cfg.llm.temperature,
+        reasoning=Reasoning(
+            effort=cfg.llm.reasoning_effort,
+            summary="auto",
+        ),
         response_format=ChatFormatJSONSchemaConfig(
             type="json_schema",
             json_schema=ChatJSONSchemaConfig(

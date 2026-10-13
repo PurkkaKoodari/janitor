@@ -21,6 +21,7 @@ import re, tomllib
 from functools import cached_property
 from typing import Literal
 
+from openrouter.components import Effort
 from pydantic import BaseModel, computed_field, field_validator
 
 from janitorbot.log import logger
@@ -70,6 +71,7 @@ class LLMConfig(BaseModel):
     openrouter_key: str
     model: str
     temperature: float = 0.5
+    reasoning_effort: Effort | None = "medium"
     timeout: float = 15.0
     retry_delay: float = 1.0
     retry_count: int = 2
