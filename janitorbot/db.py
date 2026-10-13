@@ -58,6 +58,10 @@ cursor.execute("""
     ON spam_messages (user_id, timestamp)
     """)
 cursor.execute("""
+    CREATE INDEX IF NOT EXISTS spam_messages_user_chat
+    ON spam_messages (user_id, chat_id)
+    """)
+cursor.execute("""
     CREATE INDEX IF NOT EXISTS spam_messages_reasoning_timestamp
     ON spam_messages (timestamp) WHERE llm_reasoning IS NOT NULL
     """)
@@ -296,6 +300,34 @@ def recent_spam_count(user_id: int) -> int:
         [user_id, int(time.time() - cfg.established_user.ban_threshold_days * 86400)],
     )
     return cursor.fetchone()[0]
+
+
+def join_message_ids(chat_id: int, user_id: int) -> list[int]:
+    """Return the IDs of the recorded join messages of the user in the chat."""
+    cursor.execute(
+        """
+        SELECT DISTINCT message_id FROM spam_messages
+        WHERE user_id = ? AND chat_id = ? AND system
+        """,
+        [user_id, chat_id],
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def mentioning_message_ids(chat_id: int, user_id: int, mention: str) -> list[int]:
+    """
+    Return the IDs of the recorded non-system messages of the user in the chat that mention the
+    given lowercase username.
+    """
+    cursor.execute(
+        """
+        SELECT DISTINCT message_id FROM spam_messages
+        WHERE user_id = ? AND chat_id = ? AND NOT system
+        AND instr(' ' || mentions || ' ', ?) > 0
+        """,
+        [user_id, chat_id, f" {mention} "],
+    )
+    return [row[0] for row in cursor.fetchall()]
 
 
 def purge_old_reasonings() -> None:

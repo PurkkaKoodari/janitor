@@ -42,6 +42,8 @@ from janitorbot.db import (
     effective_admins,
     effective_moderated_chats,
     is_established_user,
+    join_message_ids,
+    mentioning_message_ids,
     recent_spam_count,
     record_message,
     system_prompt_hash,
@@ -532,6 +534,26 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         return True
 
 
+async def delete_messages(bot: Bot, chat_id: int, message_ids: list[int], what: str) -> None:
+    """Delete the given messages in the chat, ignoring messages that no longer exist."""
+    if not message_ids:
+        return
+    logger.info("Deleting %d %s", len(message_ids), what)
+    for start in range(0, len(message_ids), 100):
+        try:
+            await bot.delete_messages(chat_id=chat_id, message_ids=message_ids[start : start + 100])
+        except TelegramError:
+            logger.warning("Failed to delete %s", what, exc_info=True)
+
+
+async def ban_user(bot: Bot, msg: Message, user: User) -> None:
+    """Ban the user from the message's chat and delete their join messages there."""
+    await msg.chat.ban_member(user_id=user.id)
+    await delete_messages(
+        bot, msg.chat.id, join_message_ids(msg.chat.id, user.id), "join message(s) of banned user"
+    )
+
+
 async def attempt_delete_ban(
     bot: Bot,
     msg: Message,
@@ -571,6 +593,14 @@ async def attempt_delete_ban(
                 await msg.delete()
             except TelegramError as ex:
                 no_delete = f"\nFailed to delete: {ex}"
+            if caller and sender.username:
+                # Also make sure to delete the calling messages.
+                await delete_messages(
+                    bot,
+                    msg.chat.id,
+                    mentioning_message_ids(msg.chat.id, caller.id, sender.username.lower()),
+                    "message(s) of caller mentioning the bot",
+                )
             if mode != "ban":
                 no_ban = "\n(banning disabled for this chat)"
             elif (
@@ -582,7 +612,7 @@ async def attempt_delete_ban(
                 no_ban = "\n(established user, not banned)"
             else:
                 try:
-                    await msg.chat.ban_member(user_id=sender.id)
+                    await ban_user(bot, msg, sender)
                 except TelegramError as ex:
                     no_ban = f"\nFailed to ban: {ex}"
 
@@ -595,7 +625,7 @@ async def attempt_delete_ban(
             )
         else:
             try:
-                await msg.chat.ban_member(user_id=caller.id)
+                await ban_user(bot, msg, caller)
                 caller_ban_text = f"Also banned {caller_name} for calling the bot!"
             except TelegramError as ex:
                 caller_ban_text = f"Failed to ban caller {caller_name}: {ex}"
