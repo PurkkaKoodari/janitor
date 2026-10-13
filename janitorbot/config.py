@@ -62,6 +62,7 @@ class LLMConfig(BaseModel):
     multisample_count: int = 0
     outlier_threshold: float = 0.2
     chat_purposes: dict[str, str]
+    reasoning_retention_days: int = 90
 
     @field_validator("openrouter_key")
     @classmethod

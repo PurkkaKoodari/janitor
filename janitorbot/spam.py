@@ -34,10 +34,15 @@ from openrouter.errors import BadRequestResponseErrorData, OpenRouterError
 
 from janitorbot.config import Rule, cfg
 from janitorbot.db import (
+    MessageRecord,
+    cached_verdict,
     chat_mode,
     chat_purpose,
+    content_hash,
     effective_admins,
     effective_moderated_chats,
+    record_message,
+    system_prompt_hash,
 )
 from janitorbot.log import logger
 
@@ -111,6 +116,59 @@ def parse_message(msg: Message) -> tuple[str, bool, str]:
         text += f"\n{preview.url}"
 
     return text, has_media, media_info
+
+
+def extract_mentions(msg: Message) -> list[str]:
+    """
+    Return the users and URLs mentioned in the message. Users are lowercase usernames or numeric
+    user IDs, URLs include hidden link targets and the link preview URL.
+    """
+    types: list[str | None] = [
+        MessageEntity.MENTION,
+        MessageEntity.TEXT_MENTION,
+        MessageEntity.URL,
+        MessageEntity.TEXT_LINK,
+    ]
+    entities = msg.parse_entities(types) | msg.parse_caption_entities(types)
+    mentions: list[str] = []
+    for entity, text in entities.items():
+        if entity.type == MessageEntity.TEXT_MENTION and entity.user:
+            mentions.append(str(entity.user.id))
+        elif entity.type == MessageEntity.MENTION:
+            mentions.append(text.removeprefix("@").lower())
+        elif entity.type == MessageEntity.TEXT_LINK and entity.url:
+            mentions.append(entity.url)
+        elif entity.type == MessageEntity.URL:
+            mentions.append(text)
+    preview = msg.link_preview_options
+    if preview and preview.url:
+        mentions.append(str(preview.url))
+    return sorted(set(mentions))
+
+
+def record_checked_message(
+    msg: Message,
+    spam: bool,
+    *,
+    sp_hash: bytes | None = None,
+    c_hash: bytes | None = None,
+    samples: list[tuple[float, str | None]] | None = None,
+) -> None:
+    """Store the result of spam checking the message in the database."""
+    record_message(
+        MessageRecord(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            user_id=cast(User, msg.from_user).id,
+            timestamp=int(msg.date.timestamp()),
+            system=False,
+            spam=spam,
+            mentions=extract_mentions(msg),
+            system_prompt_hash=sp_hash,
+            content_hash=c_hash,
+            llm_samples=samples,
+        )
+    )
 
 
 TME_LINK_REGEX = re.compile(r"https?://t\.me/[^\s)\]]+")
@@ -362,6 +420,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         matching_regex = next(
             (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
         )
+        record_checked_message(msg, True)
         await attempt_delete_ban(bot, msg, reasoning=f"Matched spam regex: {matching_regex}")
         return False
 
@@ -373,33 +432,53 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     else:
         purpose = chat_purpose(msg.chat.id)
 
+    system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
+    sp_hash = system_prompt_hash(system_prompt)
+
     llm_user_message = await prepare_llm_check(text, media_info)
 
     # If the message has too little data to check, skip the LLM and assume it's not spam.
     if llm_user_message is None:
         logger.info("Short message, skipping LLM check!")
+        record_checked_message(msg, False)
         return True
 
     if sender.id in effective_admins() and text.startswith("debug:\n"):
-        text = text[len("debug:\n") :]
-        system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
         logger.info("Debug mode, sending system prompt to admin.")
         await bot.send_message(
             chat_id=sender.id,
             reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
             text=f"System prompt:\n{system_prompt}\n\nMessage:\n{llm_user_message}"[:4095],
         )
+        record_checked_message(msg, False)
         return True
 
+    # Reuse the verdict of an identical earlier message checked with the same system prompt.
+    c_hash = content_hash(llm_user_message)
+    cached_probs = cached_verdict(sp_hash, c_hash)
+
     # Now run the LLM check and react to the result.
-    logger.info("LLM checking message...")
     try:
-        benign = True
-        prob, reasoning, samples = await llm_check(llm_user_message, purpose)
-        if prob >= cfg.llm.threshold:
+        recorded_samples: list[tuple[float, str | None]]
+        if cached_probs:
+            # Only record the reused median, not the reasoning or the individual samples.
+            prob = cached_probs[(len(cached_probs) - 1) // 2]
+            reasoning = "Cached LLM verdict"
+            samples = [(cached_prob, "") for cached_prob in cached_probs]
+            recorded_samples = [(prob, None)]
+            logger.info("Using cached verdict, spam probability: %.2f", prob)
+        else:
+            logger.info("LLM checking message...")
+            prob, reasoning, samples = await llm_check(llm_user_message, purpose)
+            recorded_samples = list(samples)
+        benign = prob < cfg.llm.threshold
+        record_checked_message(
+            msg, not benign, sp_hash=sp_hash, c_hash=c_hash, samples=recorded_samples
+        )
+
+        if not benign:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning, samples=samples)
-            benign = False
         elif cfg.debug:
             # Not spam, but still send the reasoning to the admins for debugging.
             sampled = sampled_prob_range(samples)
@@ -409,7 +488,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                 text=f"Spam probability: {prob:.2f}{sampled}\nReasoning: {reasoning}"[:4095],
             )
 
-        if cfg.debug and len(samples) >= 2:
+        if cfg.debug and not cached_probs and len(samples) >= 2:
             # Attempt to detect outliers in the sampling in case there's room for improvement in the system prompt.
             for sample_prob, sample_reasoning in (samples[0], samples[-1]):
                 if abs(sample_prob - prob) >= cfg.llm.outlier_threshold:
@@ -424,6 +503,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
         return benign
     except RuntimeError as e:
+        record_checked_message(msg, False, c_hash=c_hash)
         if not cfg.quiet:
             await bot.send_message(
                 chat_id=cfg.admins[0],

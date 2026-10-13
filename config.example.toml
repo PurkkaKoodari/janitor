@@ -123,6 +123,10 @@ multisample_count = 3
 # Set to 1.0 to disable outlier detection.
 outlier_threshold = 0.2
 
+# LLM reasonings are deleted from the database after this many days, as they often paraphrase
+# the message content. Verdicts are kept for caching.
+reasoning_retention_days = 90
+
 # Map chat IDs (as strings) to a description of each chat's purpose.
 # The default key is used as the fallback.
 [llm.chat_purposes]

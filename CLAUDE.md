@@ -72,6 +72,8 @@ Import chain (acyclic): `log` ← `config` ← `db` ← `spam` ← `channel` ←
 3. **Channel forwarding** (`forward_to_channel`, called by `process_message` once spam checks pass): ignore rules → length heuristics → copies to channel with "See message" / "Delete this" buttons
 4. The `messages` SQLite table maps channel message IDs → original message IDs + author, enabling reply threading and self-deletion
 
+Every spam-checked message is recorded in the `spam_messages` table. LLM verdicts are cached: a message whose LLM input matches identically reuses the median of all recorded probabilities for it instead of calling the LLM.
+
 ### Moderation modes (per chat, stored in DB)
 
 - `ban` (default) — delete message and ban sender
@@ -85,6 +87,7 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 ### SQLite schema
 
 - `messages(id, orig_id, author)` — channel msg id → source msg id + author user id
+- `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample (or a single row with `llm_sample` NULL if not LLM-checked) per message; edits add new rows, no primary key. `llm_reasoning` is purged after `reasoning_retention_days`
 - `chats(id, purpose, mode)` — dynamically added moderated chats with optional LLM purpose override and moderation mode
 - `admins(id)` — dynamically added admin user IDs
 

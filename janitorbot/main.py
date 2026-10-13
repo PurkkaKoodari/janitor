@@ -51,7 +51,7 @@ from janitorbot.db import (
     effective_spam_checked_chats,
 )
 from janitorbot.log import logger, message_logging
-from janitorbot.spam import attempt_delete_ban, check_spam, parse_message
+from janitorbot.spam import attempt_delete_ban, check_spam, parse_message, record_checked_message
 
 
 async def process_message(bot: Bot, msg: Message):
@@ -97,12 +97,14 @@ async def process_message(bot: Bot, msg: Message):
         and msg.story
         and msg.story.chat.id != sender.id
     ):
+        record_checked_message(msg, True)
         await attempt_delete_ban(bot, msg, reasoning="Forwarded story")
         return
 
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
     if msg.chat.id in effective_moderated_chats() and fwd_from_channel:
         if cfg.spam.channel_forwarded_with_keyboard and msg.reply_markup:
+            record_checked_message(msg, True)
             await attempt_delete_ban(
                 bot, msg, reasoning="Forwarded message from channel with inline keyboard"
             )
@@ -113,6 +115,7 @@ async def process_message(bot: Bot, msg: Message):
             and re.search(cfg.spam.suspicious_link_regex, text)
             and re.search(r"[\u0400-\u052F]", text, re.I)
         ):
+            record_checked_message(msg, True)
             await attempt_delete_ban(
                 bot,
                 msg,

@@ -17,6 +17,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import asyncio
 from html import escape
 from typing import Any, cast
 
@@ -47,6 +48,7 @@ from janitorbot.db import (
     db_chat_purposes,
     effective_admins,
     effective_moderated_chats,
+    purge_old_reasonings,
 )
 from janitorbot.log import logger
 
@@ -82,9 +84,20 @@ async def set_admin_commands(bot: Bot, user_id: int) -> None:
         logger.warning("Could not set commands for user %s", user_id, exc_info=True)
 
 
+async def purge_old_reasonings_loop() -> None:
+    """Periodically delete expired LLM reasonings from the database."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            purge_old_reasonings()
+        except Exception:
+            logger.error("Failed to purge old reasonings", exc_info=True)
+
+
 async def post_init(app: Application[Bot, Any, Any, Any, Any, Any]) -> None:
     for user_id in effective_admins():
         await set_admin_commands(app.bot, user_id)
+    app.create_task(purge_old_reasonings_loop())
 
 
 async def handle_moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
