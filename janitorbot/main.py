@@ -57,11 +57,11 @@ from janitorbot.db import (
     effective_spam_checked_chats,
 )
 from janitorbot.log import logger, message_logging
+from janitorbot.search import search_forwarded, search_text
 from janitorbot.spam import (
     attempt_delete_ban,
     check_spam,
     parse_message,
-    record_checked_message,
     record_joins,
 )
 
@@ -111,6 +111,18 @@ async def process_message(bot: Bot, msg: Message):
 
     text, _, _ = parse_message(msg)
 
+    # Admins can look up the recorded reasoning for a message instead of simulating it.
+    if msg.chat.type == "private" and msg.chat.id in effective_admins():
+        if msg.forward_origin:
+            # Fall back to simulation if no recorded verdict was found for the forwarded message.
+            if await search_forwarded(bot, msg):
+                return
+        elif text.startswith("search:\n"):
+            text = text[len("search:\n") :]
+            await search_text(bot, msg, text)
+            # With search:, never simulate. The admin clearly intends to only search previous verdicts.
+            return
+
     # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
     if (
         cfg.spam.forwarded_story
@@ -118,14 +130,12 @@ async def process_message(bot: Bot, msg: Message):
         and msg.story
         and msg.story.chat.id != sender.id
     ):
-        record_checked_message(msg, True)
         await attempt_delete_ban(bot, msg, reasoning="Forwarded story")
         return
 
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
     if msg.chat.id in effective_moderated_chats() and fwd_from_channel:
         if cfg.spam.channel_forwarded_with_keyboard and msg.reply_markup:
-            record_checked_message(msg, True)
             await attempt_delete_ban(
                 bot, msg, reasoning="Forwarded message from channel with inline keyboard"
             )
@@ -136,7 +146,6 @@ async def process_message(bot: Bot, msg: Message):
             and re.search(cfg.spam.suspicious_link_regex, text)
             and re.search(r"[\u0400-\u052F]", text, re.I)
         ):
-            record_checked_message(msg, True)
             await attempt_delete_ban(
                 bot,
                 msg,

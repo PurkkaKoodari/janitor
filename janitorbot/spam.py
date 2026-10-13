@@ -34,6 +34,7 @@ from openrouter.errors import BadRequestResponseErrorData, OpenRouterError
 
 from janitorbot.config import Rule, cfg
 from janitorbot.db import (
+    CACHED_REASONING,
     MessageRecord,
     cached_verdict,
     chat_mode,
@@ -158,9 +159,13 @@ def record_checked_message(
     *,
     sp_hash: bytes | None = None,
     c_hash: bytes | None = None,
-    samples: list[tuple[float, str | None]] | None = None,
+    samples: Sequence[tuple[float, str | None]] | None = None,
+    reasoning: str | None = None,
 ) -> None:
-    """Store the result of spam checking the message in the database."""
+    """
+    Store the result of spam checking the message in the database, with either the LLM samples or
+    the non-LLM reasoning.
+    """
     record_message(
         MessageRecord(
             chat_id=msg.chat.id,
@@ -173,6 +178,7 @@ def record_checked_message(
             system_prompt_hash=sp_hash,
             content_hash=c_hash,
             llm_samples=samples,
+            reasoning=reasoning,
         )
     )
 
@@ -227,15 +233,15 @@ async def fetch_tme_description(url: str) -> str:
     return (parser.description or "").strip()
 
 
-async def prepare_llm_check(text: str, media_info: str) -> str | None:
+async def prepare_llm_check(text: str, media_info: str, *, force: bool = False) -> str | None:
     """Build the user message content to send to the LLM, embedding attachment info and any
     linked Telegram post description as an <attachments> tag, as described in the system
     prompt's <message_format> section.
 
-    Return None if the message has too little data to be worth checking via LLM."""
+    Return None if the message has too little data to be worth checking via LLM, unless forced."""
     # A media with a description always gets forwarded to the LLM.
     # This is checked via formatting, as any media_info usually exceeds cfg.llm.min_length.
-    force_llm = "\n\n" in media_info or ":" in media_info
+    force_llm = force or "\n\n" in media_info or ":" in media_info
 
     tme_link = TME_LINK_REGEX.search(text)
     if tme_link:
@@ -420,10 +426,13 @@ async def llm_check(
     return (prob, reasoning, samples)
 
 
-def sampled_prob_range(samples: list[tuple[float, str]]) -> str:
+def sampled_prob_range(samples: list[float]) -> str:
+    """
+    Formats the range of spam probabilities in the samples if there are multiple samples.
+    """
     if len(samples) < 2:
         return ""
-    return f" ({samples[0][0]:.2f}\u2026{samples[-1][0]:.2f})"
+    return f" ({min(samples):.2f}\u2026{max(samples):.2f})"
 
 
 async def check_spam(bot: Bot, msg: Message) -> bool:
@@ -442,7 +451,6 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         matching_regex = next(
             (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
         )
-        record_checked_message(msg, True)
         await attempt_delete_ban(bot, msg, reasoning=f"Matched spam regex: {matching_regex}")
         return False
 
@@ -462,7 +470,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     # If the message has too little data to check, skip the LLM and assume it's not spam.
     if llm_user_message is None:
         logger.info("Short message, skipping LLM check!")
-        record_checked_message(msg, False)
+        record_checked_message(msg, False, reasoning="Short message, skipped LLM check")
         return True
 
     if sender.id in effective_admins() and text.startswith("debug:\n"):
@@ -472,7 +480,6 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
             reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
             text=f"System prompt:\n{system_prompt}\n\nMessage:\n{llm_user_message}"[:4095],
         )
-        record_checked_message(msg, False)
         return True
 
     # Reuse the verdict of an identical earlier message checked with the same system prompt.
@@ -481,29 +488,34 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # Now run the LLM check and react to the result.
     try:
-        recorded_samples: list[tuple[float, str | None]]
+        samples: Sequence[tuple[float, str | None]]
         if cached_probs:
             # Only record the reused median, not the reasoning or the individual samples.
             prob = cached_probs[(len(cached_probs) - 1) // 2]
-            reasoning = "Cached LLM verdict"
-            samples = [(cached_prob, "") for cached_prob in cached_probs]
-            recorded_samples = [(prob, None)]
+            samples = [(prob, CACHED_REASONING)]
+            # Still show the range of the cached samples in the monitor chat.
+            sample_probs = cached_probs
+            reasoning = "Cached LLM verdict from previous message"
             logger.info("Using cached verdict, spam probability: %.2f", prob)
         else:
             logger.info("LLM checking message...")
             prob, reasoning, samples = await llm_check(llm_user_message, purpose)
-            recorded_samples = list(samples)
-        benign = prob < cfg.llm.threshold
-        record_checked_message(
-            msg, not benign, sp_hash=sp_hash, c_hash=c_hash, samples=recorded_samples
-        )
-
-        if not benign:
+            sample_probs = [sample[0] for sample in samples]
+        spam = prob >= cfg.llm.threshold
+        # Store the verdict.
+        record_checked_message(msg, spam, sp_hash=sp_hash, c_hash=c_hash, samples=samples)
+        if spam:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
-            await attempt_delete_ban(bot, msg, prob=prob, reasoning=reasoning, samples=samples)
+            await attempt_delete_ban(
+                bot,
+                msg,
+                reasoning=reasoning,
+                prob=prob,
+                sample_probs=sample_probs,
+            )
         elif cfg.debug:
             # Not spam, but still send the reasoning to the admins for debugging.
-            sampled = sampled_prob_range(samples)
+            sampled = sampled_prob_range(sample_probs)
             await bot.send_message(
                 chat_id=cfg.admins[0],
                 reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
@@ -523,9 +535,9 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                         f"Reasoning: {sample_reasoning}"[:4095],
                     )
 
-        return benign
+        return not spam
     except RuntimeError as e:
-        record_checked_message(msg, False, c_hash=c_hash)
+        record_checked_message(msg, False, c_hash=c_hash, reasoning=str(e)[:4095])
         if not cfg.quiet:
             await bot.send_message(
                 chat_id=cfg.admins[0],
@@ -587,13 +599,19 @@ async def ban_user(bot: Bot, msg: Message, user: User) -> None:
 async def attempt_delete_ban(
     bot: Bot,
     msg: Message,
+    reasoning: str,
     prob: float | None = None,
-    reasoning: str | None = None,
-    samples: list[tuple[float, str]] = [],
+    sample_probs: list[float] = [],
 ):
     """
     Attempt to delete the message and ban the sender, and forward the message to the monitor chat with the reasoning.
+
+    Without sample_probs, the message is recorded as spam with the non-LLM reasoning; LLM checks
+    record their samples themselves.
     """
+    if not sample_probs:
+        record_checked_message(msg, True, reasoning=reasoning)
+
     sender = cast(User, msg.from_user)
     caller = msg.guest_bot_caller_user
     monitor = sender.id if sender.id in effective_admins() else cfg.chats.monitor
@@ -669,7 +687,7 @@ async def attempt_delete_ban(
             or msg.chat.effective_name
             or str(msg.chat.id)
         )
-        sampled = sampled_prob_range(samples)
+        sampled = sampled_prob_range(sample_probs)
         text = (
             f"Posted by {user_name} in {chat_name}"
             + (f"\nSpam probability: {prob:.2f}{sampled}" if prob is not None else "")

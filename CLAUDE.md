@@ -8,7 +8,7 @@ JanitorBot is a Telegram bot that moderates Telegram group chats using an LLM (v
 
 ## Commands
 
-Uses `uv` for dependency management (Python 3.11, locked in `uv.lock`).
+Uses `uv` for dependency management (Python 3.13, locked in `uv.lock`).
 
 ```bash
 # Run the bot
@@ -29,7 +29,7 @@ No test suite exists. `config.toml` must exist (copy from `config.example.toml`)
 - Always use type annotations.
 - Docstrings for all functions and classes.
 - Use f-strings for formatting.
-- Black, line length 100, target Python 3.11.
+- Black, line length 100, target Python 3.13.
 - Always run Black after finalizing code changes.
 
 ## Architecture
@@ -42,10 +42,11 @@ The bot logic lives in the `janitorbot/` package, split into focused modules. Co
 - `janitorbot/spam.py` — message parsing, LLM calls, spam detection, and delete/ban actions
 - `janitorbot/channel.py` — `forward_to_channel` / `edit_in_channel`: forwarding source messages (and edits) to the channel, only after spam checks pass
 - `janitorbot/commands.py` — Telegram command and callback-query handlers
+- `janitorbot/search.py` — admin DM lookups of recorded reasonings: forwarded messages (falling back to simulation if unmatched) and `search:` messages
 - `janitorbot/main.py` — message routing/spam-check orchestration (`process_message` / `process_edit`), the message handlers, auto-restart watcher, handler registration, `main()`
 - `janitor.py` — thin launcher (`from janitorbot.main import main`)
 
-Import chain (acyclic): `log` ← `config` ← `db` ← `spam` ← `channel` ← `commands` ← `main`. Module-level side effects (load `cfg`, open DB, build `or_client`) fire in that order.
+Import chain (acyclic): `log` ← `config` ← `db` ← `spam` ← `channel` ← `commands` ← `search` ← `main`. Module-level side effects (load `cfg`, open DB, build `or_client`) fire in that order.
 
 ### Chat roles
 
@@ -66,7 +67,7 @@ Import chain (acyclic): `log` ← `config` ← `db` ← `spam` ← `channel` ←
 1. `handle_message` → `process_message` (spawned as asyncio task)
 2. **Spam check** (`check_spam`):
    - Regex patterns from `config.spam.regex` checked first (no LLM call)
-   - Messages < 20 chars skip LLM
+   - Messages shorter than `llm.min_length` skip LLM
    - LLM call via OpenRouter returns `{"prob": float}` using structured JSON output
    - If `prob >= threshold`, calls `attempt_delete_ban`
 3. **Channel forwarding** (`forward_to_channel`, called by `process_message` once spam checks pass): ignore rules → length heuristics → copies to channel with "See message" / "Delete this" buttons
@@ -87,7 +88,13 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 ### SQLite schema
 
 - `messages(id, orig_id, author)` — channel msg id → source msg id + author user id
-- `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample (or a single row with `llm_sample` NULL if not LLM-checked) per message; edits add new rows, no primary key. Joins are recorded as `system` rows for each joined user. `llm_reasoning` is purged after `reasoning_retention_days`
+- `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample
+  - If not LLM-checked, single row with `llm_sample`/`llm_prob` NULL and the non-LLM reasoning or error in `llm_reasoning`
+  - Edits add new rows (but may reuse cached verdicts)
+  - No primary key
+  - Cached verdicts are a single sample with `llm_reasoning` = `CACHED_REASONING`
+  - Joins are recorded as `system` rows for each joined user
+  - Reasonings are replaced with `PURGED_REASONING` after `reasoning_retention_days`
 - `chats(id, purpose, mode, delete_join_leave)` — dynamically added moderated chats and per-chat setting overrides (NULL = config default); cached in memory as `db_chats`
 - `admins(id)` — dynamically added admin user IDs
 

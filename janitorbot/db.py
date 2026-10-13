@@ -18,10 +18,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import hashlib, sqlite3, time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from janitorbot.config import Mode, cfg
+
+CACHED_REASONING = "cached"
+PURGED_REASONING = "purged"
 
 db = sqlite3.connect(cfg.db_name)
 cursor = db.cursor()
@@ -62,8 +66,12 @@ cursor.execute("""
     ON spam_messages (user_id, chat_id)
     """)
 cursor.execute("""
-    CREATE INDEX IF NOT EXISTS spam_messages_reasoning_timestamp
-    ON spam_messages (timestamp) WHERE llm_reasoning IS NOT NULL
+    DROP INDEX IF EXISTS spam_messages_reasoning_timestamp
+    """)
+cursor.execute(f"""
+    CREATE INDEX IF NOT EXISTS spam_messages_purgeable
+    ON spam_messages (timestamp)
+    WHERE llm_reasoning IS NOT NULL AND llm_reasoning NOT IN ('{CACHED_REASONING}', '{PURGED_REASONING}')
     """)
 _CHATS_SCHEMA = """
     CREATE TABLE IF NOT EXISTS {table} (
@@ -215,14 +223,18 @@ class MessageRecord:
     mentions: list[str]
     system_prompt_hash: bytes | None = None
     content_hash: bytes | None = None
-    llm_samples: list[tuple[float, str | None]] | None = None
+    llm_samples: Sequence[tuple[float, str | None]] | None = None
+    reasoning: str | None = None
 
 
 def record_message(record: MessageRecord) -> None:
-    """Store the message, with one row per LLM sample. Edits add new rows."""
-    samples: list[tuple[int | None, tuple[float | None, str | None]]] = list(
+    """
+    Store the message, with one row per LLM sample, or a single row with the non-LLM reasoning.
+    Edits add new rows.
+    """
+    samples: Sequence[tuple[int | None, tuple[float | None, str | None]]] = list(
         enumerate(record.llm_samples or [])
-    ) or [(None, (None, None))]
+    ) or [(None, (None, record.reasoning))]
     cursor.executemany(
         "INSERT INTO spam_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
@@ -260,6 +272,136 @@ def cached_verdict(sp_hash: bytes, c_hash: bytes) -> list[float]:
         [c_hash, sp_hash],
     )
     return [row[0] for row in cursor.fetchall()]
+
+
+@dataclass
+class RecordedCheck:
+    """
+    A single recorded spam check of a message, with its LLM samples, or the non-LLM reasoning if
+    there are none.
+    """
+
+    rowid: int
+    chat_id: int
+    message_id: int
+    timestamp: int
+    spam: bool
+    system_prompt_hash: bytes | None
+    content_hash: bytes | None
+    llm_samples: list[tuple[float, str | None]]
+    reasoning: str | None = None
+
+    @property
+    def cached(self) -> bool:
+        """Whether the verdict was reused from earlier checks."""
+        return len(self.llm_samples) == 1 and self.llm_samples[0][1] == CACHED_REASONING
+
+    @property
+    def purged(self) -> bool:
+        """Whether the reasoning was purged due to age."""
+        return len(self.llm_samples) > 0 and self.llm_samples[0][1] == PURGED_REASONING
+
+
+class _CheckRow(NamedTuple):
+    """A spam_messages row as selected for grouping into checks."""
+
+    rowid: int
+    chat_id: int
+    message_id: int
+    timestamp: int
+    spam: int
+    system_prompt_hash: bytes | None
+    content_hash: bytes | None
+    llm_sample: int | None
+    llm_prob: float | None
+    llm_reasoning: str | None
+
+
+_CHECK_COLUMNS = ", ".join(_CheckRow._fields)
+
+
+def _group_checks(rows: Iterable[_CheckRow]) -> list[RecordedCheck]:
+    """Group spam_messages rows (in rowid order) into checks; each check starts at sample 0/NULL."""
+    checks: list[RecordedCheck] = []
+    for row in rows:
+        if not row.llm_sample or not checks:
+            checks.append(
+                RecordedCheck(
+                    row.rowid,
+                    row.chat_id,
+                    row.message_id,
+                    row.timestamp,
+                    bool(row.spam),
+                    row.system_prompt_hash,
+                    row.content_hash,
+                    [],
+                )
+            )
+        if row.llm_prob is not None:
+            checks[-1].llm_samples.append((row.llm_prob, row.llm_reasoning))
+        else:
+            checks[-1].reasoning = row.llm_reasoning
+    return checks
+
+
+def find_checks(user_id: int | None, timestamp: int, c_hash: bytes | None) -> list[RecordedCheck]:
+    """
+    Return the recorded checks of non-system messages sent at the timestamp, optionally filtered
+    by sender and LLM user message hash.
+    """
+    conditions = ["timestamp = ?", "NOT system"]
+    params: list[object] = [timestamp]
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
+    if c_hash is not None:
+        conditions.append("content_hash = ?")
+        params.append(c_hash)
+    cursor.execute(
+        f"SELECT {_CHECK_COLUMNS} FROM spam_messages WHERE {" AND ".join(conditions)} ORDER BY rowid",
+        params,
+    )
+    return _group_checks(map(_CheckRow._make, cursor))
+
+
+def latest_uncached_check(
+    *, c_hash: bytes, sp_hash: bytes | None = None, before: int | None = None
+) -> RecordedCheck | None:
+    """
+    Return the latest LLM check with reasoning (i.e. not a cached verdict) of the LLM user
+    message hash, optionally also matching the system prompt hash and preceding the given rowid.
+    """
+    conditions = [
+        "content_hash = ?",
+        "llm_prob IS NOT NULL",
+        f"llm_reasoning != '{CACHED_REASONING}'",
+    ]
+    params: list[object] = [c_hash]
+    if sp_hash is not None:
+        conditions.append("system_prompt_hash = ?")
+        params.append(sp_hash)
+    if before is not None:
+        conditions.append("rowid < ?")
+        params.append(before)
+    cursor.execute(f"SELECT MAX(rowid) FROM spam_messages WHERE {" AND ".join(conditions)}", params)
+    (last,) = cursor.fetchone()
+    if last is None:
+        return None
+    # The found row is the last sample of its check; collect rows backwards to its first sample.
+    cursor.execute(
+        f"""
+        SELECT {_CHECK_COLUMNS} FROM spam_messages
+        WHERE content_hash = ? AND rowid <= ?
+        ORDER BY rowid DESC
+        """,
+        [c_hash, last],
+    )
+    rows: list[_CheckRow] = []
+    for row in map(_CheckRow._make, cursor):
+        rows.append(row)
+        if not row.llm_sample:
+            break
+    return _group_checks(rows[::-1])[-1]
 
 
 def is_established_user(user_id: int) -> bool:
@@ -369,10 +511,10 @@ def purge_old_reasonings() -> None:
     """Delete LLM reasonings older than the retention period, as they often contain the content."""
     cutoff = int(time.time()) - cfg.llm.reasoning_retention_days * 86400
     cursor.execute(
-        "UPDATE spam_messages SET llm_reasoning = NULL WHERE llm_reasoning IS NOT NULL AND timestamp < ?",
+        f"""
+        UPDATE spam_messages SET llm_reasoning = '{PURGED_REASONING}'
+        WHERE llm_reasoning IS NOT NULL AND llm_reasoning NOT IN ('{CACHED_REASONING}', '{PURGED_REASONING}') AND timestamp < ?
+        """,
         [cutoff],
     )
     db.commit()
-
-
-purge_old_reasonings()

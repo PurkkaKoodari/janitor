@@ -269,11 +269,11 @@ async def set_admin_commands(bot: Bot, user_id: int) -> None:
 async def purge_old_reasonings_loop() -> None:
     """Periodically delete expired LLM reasonings from the database."""
     while True:
-        await asyncio.sleep(3600)
         try:
             purge_old_reasonings()
         except Exception:
             logger.error("Failed to purge old reasonings", exc_info=True)
+        await asyncio.sleep(3600)
 
 
 async def post_init(app: Application[Bot, Any, Any, Any, Any, Any]) -> None:
