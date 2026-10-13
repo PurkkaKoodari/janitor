@@ -18,6 +18,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import asyncio
+from dataclasses import dataclass
 from collections.abc import Callable, Coroutine, Sequence
 from html import escape
 from typing import Any, Literal, cast, get_args
@@ -149,6 +150,41 @@ async def notify_monitor(bot: Bot, msg: Message, sender: User, html: str) -> Non
         )
 
 
+@dataclass
+class ChatName:
+    """
+    A chat's ID and its @handle or title (if known), formatted for display in replies and HTML
+    messages. The handle is preferred, as Telegram makes it clickable.
+    """
+
+    id: int
+    username: str | None
+    title: str | None
+
+    def __str__(self) -> str:
+        if self.username:
+            return f"@{self.username} ({self.id})"
+        return f"{self.title} ({self.id})" if self.title else str(self.id)
+
+    @property
+    def html(self) -> str:
+        """The chat name formatted as HTML."""
+        if self.username:
+            return f"@{escape(self.username)} (<code>{self.id}</code>)"
+        if self.title:
+            return f"<b>{escape(self.title)}</b> (<code>{self.id}</code>)"
+        return f"<code>{self.id}</code>"
+
+
+async def fetch_chat_name(bot: Bot, chat_id: int) -> ChatName:
+    """Fetch the chat's handle and title for display, falling back to just the ID on failure."""
+    try:
+        chat = await bot.get_chat(chat_id)
+    except TelegramError:
+        return ChatName(chat_id, None, None)
+    return ChatName(chat_id, chat.username, chat.title)
+
+
 def default_marker(value: object) -> str:
     """Return " (default)" if the chat's setting value is None (not overridden), otherwise ""."""
     return " (default)" if value is None else ""
@@ -243,17 +279,16 @@ async def handle_moderate(msg: Message, sender: User, args: list[str], bot: Bot)
     already_moderated = chat_id in effective_moderated_chats()
     if not already_moderated:
         add_chat(chat_id)
+    name = await fetch_chat_name(bot, chat_id)
     status = "is already moderated" if already_moderated else "moderation enabled"
     await msg.reply_text(
-        f"Chat {chat_id} {status}.\n"
+        f"Chat {name} {status}.\n"
         f"Mode: {describe_mode(chat_id)} (change with /mode)\n"
         f"Purpose: {describe_purpose(chat_id)} (change with /purpose)\n"
         f"Join/leave message deletion: {describe_delete_join_leave(chat_id)} (change with /deletejoins)"
     )
     if not already_moderated:
-        await notify_monitor(
-            bot, msg, sender, f"enabled moderation for chat <code>{chat_id}</code>."
-        )
+        await notify_monitor(bot, msg, sender, f"enabled moderation for chat {name.html}.")
 
 
 @command("unmoderate", "<chat_id>", min_args=1, max_args=1)
@@ -266,10 +301,9 @@ async def handle_unmoderate(msg: Message, sender: User, args: list[str], bot: Bo
     if chat_id not in db_chats:
         raise CommandError(f"Chat {chat_id} is not in the moderated chats database.")
     remove_chat(chat_id)
-    await msg.reply_text(f"Chat {chat_id} removed from moderated chats.")
-    await notify_monitor(
-        bot, msg, sender, f"removed chat <code>{chat_id}</code> from moderated chats."
-    )
+    name = await fetch_chat_name(bot, chat_id)
+    await msg.reply_text(f"Chat {name} removed from moderated chats.")
+    await notify_monitor(bot, msg, sender, f"removed chat {name.html} from moderated chats.")
 
 
 @command("purpose", "<chat_id> [default|purpose...]", min_args=1)
@@ -282,57 +316,60 @@ async def handle_purpose(msg: Message, sender: User, args: list[str], bot: Bot) 
         elif len(purpose) > 200:
             raise CommandError("Purpose is too long, must be at most 200 characters.")
         set_chat_setting(chat_id, "purpose", purpose)
+    name = await fetch_chat_name(bot, chat_id)
     purpose_display = describe_purpose(chat_id)
     llm_text = f'The LLM will be told it\'s in "a chat group where {purpose_display}".'
     if len(args) == 1:
-        await msg.reply_text(f"Purpose for chat {chat_id}: {purpose_display}\n{llm_text}")
+        await msg.reply_text(f"Purpose for chat {name}: {purpose_display}\n{llm_text}")
         return
-    await msg.reply_text(f"Purpose for chat {chat_id} updated.\n{llm_text}")
+    await msg.reply_text(f"Purpose for chat {name} updated.\n{llm_text}")
     await notify_monitor(
         bot,
         msg,
         sender,
-        f"set the purpose for chat <code>{chat_id}</code> to: {escape(purpose_display)}",
+        f"set the purpose for chat {name.html} to: {escape(purpose_display)}",
     )
 
 
 @command("mode", "<chat_id> [test|delete|ban|default]", min_args=1, max_args=2)
 async def handle_mode(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_moderated_chat_id(args[0])
+    name = await fetch_chat_name(bot, chat_id)
     if len(args) == 1:
-        await msg.reply_text(f"Moderation mode for chat {chat_id} is {describe_mode(chat_id)}.")
+        await msg.reply_text(f"Moderation mode for chat {name} is {describe_mode(chat_id)}.")
         await warn_missing_permissions(bot, msg, chat_id, chat_mode(chat_id))
         return
     choice = parse_choice(args[1], (*get_args(Mode), "default"), "mode")
     mode = None if choice == "default" else cast(Mode, choice)
     await warn_missing_permissions(bot, msg, chat_id, mode or cfg.spam.mode)
     set_chat_setting(chat_id, "mode", mode)
-    await msg.reply_text(f"Moderation mode for chat {chat_id} set to {describe_mode(chat_id)}.")
+    await msg.reply_text(f"Moderation mode for chat {name} set to {describe_mode(chat_id)}.")
     await notify_monitor(
         bot,
         msg,
         sender,
-        f"set moderation mode to <b>{escape(describe_mode(chat_id))}</b> for chat <code>{chat_id}</code>.",
+        f"set moderation mode to <b>{escape(describe_mode(chat_id))}</b> for chat {name.html}.",
     )
 
 
 @command("deletejoins", "<chat_id> [on|off|default]", min_args=1, max_args=2)
 async def handle_deletejoins(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     chat_id = parse_moderated_chat_id(args[0])
+    name = await fetch_chat_name(bot, chat_id)
     if len(args) == 1:
         await msg.reply_text(
-            f"Join/leave message deletion for chat {chat_id} is {describe_delete_join_leave(chat_id)}."
+            f"Join/leave message deletion for chat {name} is {describe_delete_join_leave(chat_id)}."
         )
         return
     choice = parse_choice(args[1], ("on", "off", "default"), "value")
     set_chat_setting(chat_id, "delete_join_leave", None if choice == "default" else choice == "on")
     state = describe_delete_join_leave(chat_id)
-    await msg.reply_text(f"Join/leave message deletion for chat {chat_id} set to {state}.")
+    await msg.reply_text(f"Join/leave message deletion for chat {name} set to {state}.")
     await notify_monitor(
         bot,
         msg,
         sender,
-        f"turned join/leave message deletion <b>{escape(state)}</b> for chat <code>{chat_id}</code>.",
+        f"turned join/leave message deletion <b>{escape(state)}</b> for chat {name.html}.",
     )
 
 
