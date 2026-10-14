@@ -19,7 +19,7 @@
 
 import asyncio, glob, os, re, sys, threading, time
 from html import escape
-from typing import cast
+from typing import Any, cast
 
 from telegram import Bot, Message, Update, User
 from telegram.error import TelegramError
@@ -46,7 +46,7 @@ from janitorbot.commands import (
     handle_purpose,
     handle_unadmin,
     handle_unmoderate,
-    post_init,
+    set_admin_commands,
 )
 from janitorbot.config import cfg
 from janitorbot.db import (
@@ -55,6 +55,7 @@ from janitorbot.db import (
     effective_member_chats,
     effective_moderated_chats,
     effective_spam_checked_chats,
+    purge_old_reasonings,
 )
 from janitorbot.log import logger, message_logging
 from janitorbot.search import search_forwarded, search_text
@@ -180,8 +181,9 @@ async def process_edit(bot: Bot, msg: Message):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.message)
+        app = context.application  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         with message_logging(msg.chat.id, msg.message_id):
-            asyncio.create_task(process_message(context.bot, msg))
+            app.create_task(process_message(context.bot, msg))
     except Exception:
         logger.error("Error handling message", exc_info=True)
 
@@ -189,10 +191,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.edited_message)
+        app = context.application  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         with message_logging(msg.chat.id, msg.message_id):
-            asyncio.create_task(process_edit(context.bot, msg))
+            app.create_task(process_edit(context.bot, msg))
     except Exception:
         logger.error("Error handling edited message", exc_info=True)
+
+
+async def purge_old_reasonings_loop() -> None:
+    """Periodically delete expired LLM reasonings from the database."""
+    while True:
+        try:
+            purge_old_reasonings()
+        except Exception:
+            logger.error("Failed to purge old reasonings", exc_info=True)
+        await asyncio.sleep(3600)
+
+
+async def post_init(app: Application[Bot, Any, Any, Any, Any, Any]) -> None:
+    for user_id in effective_admins():
+        await set_admin_commands(app.bot, user_id)
+    app.create_task(purge_old_reasonings_loop())
 
 
 def _watch_and_restart():

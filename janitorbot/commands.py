@@ -17,7 +17,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import asyncio
 from dataclasses import dataclass
 from collections.abc import Callable, Coroutine, Sequence
 from html import escape
@@ -36,7 +35,7 @@ from telegram import (
     User,
 )
 from telegram.error import TelegramError
-from telegram.ext import Application, ContextTypes, filters
+from telegram.ext import ContextTypes, filters
 
 from janitorbot.channel import delete_from_channel
 from janitorbot.config import Mode, cfg
@@ -52,7 +51,6 @@ from janitorbot.db import (
     db_chats,
     effective_admins,
     effective_moderated_chats,
-    purge_old_reasonings,
     remove_chat,
     set_chat_setting,
 )
@@ -264,22 +262,6 @@ async def set_admin_commands(bot: Bot, user_id: int) -> None:
         await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=user_id))
     except TelegramError:
         logger.warning("Could not set commands for user %s", user_id, exc_info=True)
-
-
-async def purge_old_reasonings_loop() -> None:
-    """Periodically delete expired LLM reasonings from the database."""
-    while True:
-        try:
-            purge_old_reasonings()
-        except Exception:
-            logger.error("Failed to purge old reasonings", exc_info=True)
-        await asyncio.sleep(3600)
-
-
-async def post_init(app: Application[Bot, Any, Any, Any, Any, Any]) -> None:
-    for user_id in effective_admins():
-        await set_admin_commands(app.bot, user_id)
-    app.create_task(purge_old_reasonings_loop())
 
 
 @command("moderate", "Enable moderation for a chat", "<chat_id>", min_args=1, max_args=1)

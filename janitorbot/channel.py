@@ -168,19 +168,30 @@ async def edit_in_channel(bot: Bot, msg: Message):
         return
 
     # Otherwise, update the message in the channel to reflect the edit.
-    if msg.text is not None:
-        await bot.edit_message_text(
-            chat_id=cfg.chats.channel,
-            message_id=row[0],
-            text=msg.text,
-            entities=msg.entities,
-            reply_markup=make_keyboard(msg),
-        )
-    elif msg.caption is not None:
-        await bot.edit_message_caption(
-            chat_id=cfg.chats.channel,
-            message_id=row[0],
-            caption=msg.caption,
-            caption_entities=msg.caption_entities,
-            reply_markup=make_keyboard(msg),
-        )
+    try:
+        if msg.text is not None:
+            await bot.edit_message_text(
+                chat_id=cfg.chats.channel,
+                message_id=row[0],
+                text=msg.text,
+                entities=msg.entities,
+                reply_markup=make_keyboard(msg),
+            )
+        elif msg.caption is not None:
+            await bot.edit_message_caption(
+                chat_id=cfg.chats.channel,
+                message_id=row[0],
+                caption=msg.caption,
+                caption_entities=msg.caption_entities,
+                reply_markup=make_keyboard(msg),
+            )
+    except BadRequest as ex:
+        # Ignore errors about the message not being modified.
+        if "message is not modified" in str(ex).lower():
+            return
+        # If the message was deleted from the channel, remove it from the DB.
+        if "message to edit not found" in str(ex).lower():
+            cursor.execute("DELETE FROM messages WHERE id = ?", [row[0]])
+            db.commit()
+            return
+        raise
