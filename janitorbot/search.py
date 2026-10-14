@@ -30,6 +30,7 @@ from janitorbot.db import (
     find_checks,
     find_mirrored_checks,
     latest_uncached_check,
+    text_hash,
 )
 from janitorbot.spam import parse_message, prepare_llm_check
 
@@ -156,10 +157,22 @@ async def search_forwarded(bot: Bot, msg: Message) -> bool:
 
 
 async def search_text(bot: Bot, msg: Message, text: str) -> None:
-    """Reply to a ``search:`` message with the latest uncached LLM check of the same content."""
+    """
+    Reply to a ``search:`` message with the latest uncached LLM check of the same content, or of
+    the same text if the attachments differ, or failing that, the latest non-LLM verdict of the
+    same text.
+    """
     _, _, media_info = parse_message(msg)
     c_hash = await _llm_content_hash(text, media_info)
     check = latest_uncached_check(c_hash=c_hash)
+    if check is None and text.strip():
+        t_hash = text_hash(text)
+        # No match with the same attachments, but perhaps the query is missing some.
+        check = latest_uncached_check(c_hash=t_hash, text_only=True)
+        if check is None:
+            # No LLM verdict, but the message may have been handled without the LLM.
+            # If so, it will have no c_hash stored (as creating it may require fetching attachments).
+            check = latest_uncached_check(c_hash=t_hash, text_only=True, llm_only=False)
     if check is None:
         await msg.reply_text("No matching spam checks found.")
         return

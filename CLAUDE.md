@@ -93,6 +93,7 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
   - If not LLM-checked, single row with `llm_sample`/`llm_prob` NULL and the non-LLM reasoning or error in `llm_reasoning`
   - Edits add new rows (but may reuse cached verdicts)
   - No primary key
+  - `text_hash` hashes only the text and is recorded for every spam check, so searches can fall back to it when attachments differ or the verdict was not from the LLM
   - Cached verdicts are a single sample with `llm_reasoning` = `CACHED_REASONING`
   - Joins are recorded as `system` rows for each joined user
   - Reasonings are replaced with `PURGED_REASONING` after `reasoning_retention_days`

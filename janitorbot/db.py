@@ -50,12 +50,23 @@ cursor.execute("""
         content_hash BLOB,
         llm_sample INTEGER,
         llm_prob REAL,
-        llm_reasoning TEXT
+        llm_reasoning TEXT,
+        text_hash BLOB
     )
     """)
+# Migrate old spam_messages tables: add text_hash.
+cursor.execute("PRAGMA table_info(spam_messages)")
+if "text_hash" not in {_row[1] for _row in cursor.fetchall()}:
+    cursor.execute("ALTER TABLE spam_messages ADD COLUMN text_hash BLOB")
+    db.commit()
 cursor.execute("""
     CREATE INDEX IF NOT EXISTS spam_messages_hashes
     ON spam_messages (content_hash, system_prompt_hash)
+    """)
+cursor.execute("""
+    CREATE INDEX IF NOT EXISTS spam_messages_text_hash
+    ON spam_messages (text_hash)
+    WHERE text_hash IS NOT NULL
     """)
 cursor.execute("""
     CREATE INDEX IF NOT EXISTS spam_messages_user
@@ -210,6 +221,11 @@ def content_hash(llm_user_message: str) -> bytes:
     return hashlib.blake2b(llm_user_message.encode(), digest_size=16).digest()
 
 
+def text_hash(text: str) -> bytes:
+    """Hash the message text into a 128-bit key."""
+    return content_hash(text.strip())
+
+
 @dataclass
 class MessageRecord:
     """Information about a message to store in the spam_messages table."""
@@ -223,6 +239,7 @@ class MessageRecord:
     mentions: list[str]
     system_prompt_hash: bytes | None = None
     content_hash: bytes | None = None
+    text_hash: bytes | None = None
     llm_samples: Sequence[tuple[float, str | None]] | None = None
     reasoning: str | None = None
 
@@ -236,7 +253,15 @@ def record_message(record: MessageRecord) -> None:
         enumerate(record.llm_samples or [])
     ) or [(None, (None, record.reasoning))]
     cursor.executemany(
-        "INSERT INTO spam_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        """
+        INSERT INTO spam_messages (
+            chat_id, message_id, user_id, timestamp,
+            system, spam, mentions,
+            system_prompt_hash, content_hash, text_hash,
+            llm_sample, llm_prob, llm_reasoning
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
         [
             [
                 record.chat_id,
@@ -248,6 +273,7 @@ def record_message(record: MessageRecord) -> None:
                 " ".join(record.mentions) or None,
                 record.system_prompt_hash,
                 record.content_hash,
+                record.text_hash,
                 index,
                 prob,
                 reasoning,
@@ -385,18 +411,25 @@ def find_mirrored_checks(channel_msg_id: int) -> list[RecordedCheck]:
 
 
 def latest_uncached_check(
-    *, c_hash: bytes, sp_hash: bytes | None = None, before: int | None = None
+    *,
+    c_hash: bytes,
+    text_only: bool = False,
+    llm_only: bool = True,
+    sp_hash: bytes | None = None,
+    before: int | None = None,
 ) -> RecordedCheck | None:
     """
-    Return the latest LLM check with reasoning (i.e. not a cached verdict) of the LLM user
-    message hash, optionally also matching the system prompt hash and preceding the given rowid.
+    Return the latest LLM check with reasoning (i.e. not a cached verdict) of either the LLM user
+    message hash or the text hash, optionally also matching the system prompt hash and preceding
+    the given rowid. Unless llm_only, checks with a non-LLM verdict or an LLM error also match.
     """
-    conditions = [
-        "content_hash = ?",
-        "llm_prob IS NOT NULL",
-        f"llm_reasoning != '{CACHED_REASONING}'",
-    ]
+    hash_column = "text_hash" if text_only else "content_hash"
+    conditions = [f"{hash_column} = ?"]
     params: list[object] = [c_hash]
+    if llm_only:
+        conditions.append(f"(llm_prob IS NOT NULL AND llm_reasoning != '{CACHED_REASONING}')")
+    else:
+        conditions.append(f"(llm_prob IS NULL OR llm_reasoning != '{CACHED_REASONING}')")
     if sp_hash is not None:
         conditions.append("system_prompt_hash = ?")
         params.append(sp_hash)
@@ -411,7 +444,7 @@ def latest_uncached_check(
     cursor.execute(
         f"""
         SELECT {_CHECK_COLUMNS} FROM spam_messages
-        WHERE content_hash = ? AND rowid <= ?
+        WHERE {hash_column} = ? AND rowid <= ?
         ORDER BY rowid DESC
         """,
         [c_hash, last],

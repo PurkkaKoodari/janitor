@@ -45,6 +45,7 @@ from janitorbot.db import (
     recent_spam_count,
     record_message,
     system_prompt_hash,
+    text_hash,
     user_message_ids,
 )
 from janitorbot.llm import DeferredLLMError, LLMError, llm_check
@@ -161,6 +162,8 @@ def record_checked_message(
     Store the result of spam checking the message in the database, with either the LLM samples or
     the non-LLM reasoning.
     """
+    text, _, _ = parse_message(msg)
+    t_hash = text_hash(text)
     record_message(
         MessageRecord(
             chat_id=msg.chat.id,
@@ -172,6 +175,7 @@ def record_checked_message(
             mentions=extract_mentions(msg),
             system_prompt_hash=sp_hash,
             content_hash=c_hash,
+            text_hash=t_hash,
             llm_samples=samples,
             reasoning=reasoning,
         )
