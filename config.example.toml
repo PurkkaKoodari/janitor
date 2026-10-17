@@ -22,10 +22,10 @@ admin_name = "your mom"
 [chats]
 # Chats that the bot moderates.
 # This is no longer recommended for use; use the /moderate command instead.
-moderated = [-1001234567890]
+moderated = []
 
 # Chat where the bot reports deleted messages, bans and admin actions for monitoring.
-monitor = -1001234567890
+monitor = 0
 
 # Delete join/leave system messages in moderated chats by default.
 # Can be overridden per chat with /deletejoins.
@@ -174,13 +174,15 @@ reasoning_retention_days = 90
 
 # Map chat IDs (as strings) to a description of each chat's purpose.
 # The default key is used as the fallback.
+# This is no longer recommended for use; use the /purpose command instead.
 [llm.chat_purposes]
-default = "people post cool messages"
-"-1001234567890" = "people post cool messages"
+default = "people discuss cool things"
+# e.g.
+# "-1001234567890" = "people discuss even cooler things"
 
 [channel_forwarding]
-# Chats used to update the channel (also implies moderated).
-source = [-1001234567890]
+# Chats IDs used to update the channel (also implies moderated).
+source = []
 
 # Channel where messages from source are forwarded.
 channel = 0
