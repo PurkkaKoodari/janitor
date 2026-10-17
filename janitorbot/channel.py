@@ -27,11 +27,12 @@ from telegram import (
     Message,
     User,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 
 from janitorbot.config import cfg
-from janitorbot.db import cursor, db
-from janitorbot.spam import matches, parse_message
+from janitorbot.db import cursor, db, delete_mirror_records, mirrored_message_ids
+from janitorbot.log import logger
+from janitorbot.messages import parse_message
 
 recent_senders: dict[int, float] = {}
 recent_ignored: dict[int, float] = {}
@@ -52,13 +53,33 @@ def make_keyboard(msg: Message) -> InlineKeyboardMarkup:
     )
 
 
-async def delete_from_channel(bot: Bot, msg_id: int):
-    """
-    Deletes a forwarded message from the channel and the DB.
-    """
-    await bot.delete_message(chat_id=cfg.chats.channel, message_id=msg_id)
-    cursor.execute("DELETE FROM messages WHERE id = ?", [msg_id])
-    db.commit()
+async def bulk_delete(bot: Bot, chat_id: int, message_ids: list[int], what: str) -> None:
+    """Delete the given messages in the chat, ignoring messages that no longer exist."""
+    if not message_ids:
+        return
+    logger.info("Deleting %d %s", len(message_ids), what)
+    for start in range(0, len(message_ids), 100):
+        try:
+            await bot.delete_messages(chat_id=chat_id, message_ids=message_ids[start : start + 100])
+        except TelegramError:
+            logger.warning("Failed to delete %s", what, exc_info=True)
+
+
+async def delete_from_channel(bot: Bot, msg_ids: list[int]) -> None:
+    """Delete the given forwarded messages from the channel and the DB."""
+    if not msg_ids:
+        return
+    await bulk_delete(
+        bot, cfg.channel_forwarding.channel, msg_ids, "mirrored message(s) in channel"
+    )
+    delete_mirror_records(msg_ids)
+
+
+async def delete_mirrors(bot: Bot, chat_id: int, message_ids: list[int]) -> None:
+    """Delete the channel mirrors of the given messages, if the chat is a source chat."""
+    if chat_id not in cfg.channel_forwarding.source or not message_ids:
+        return
+    await delete_from_channel(bot, mirrored_message_ids(message_ids))
 
 
 async def forward_to_channel(bot: Bot, msg: Message):
@@ -70,7 +91,7 @@ async def forward_to_channel(bot: Bot, msg: Message):
     sender = cast(User, msg.from_user)
 
     # Ignore messages outside SOURCE chats.
-    if msg.chat_id not in cfg.chats.source:
+    if msg.chat_id not in cfg.channel_forwarding.source or not cfg.channel_forwarding.channel:
         return
 
     text, has_media, _ = parse_message(msg)
@@ -80,31 +101,34 @@ async def forward_to_channel(bot: Bot, msg: Message):
         return
 
     # Ignore messages that match ignore rules, and mark the user as a dibser.
-    if next((rule for rule in cfg.channel_ignore.rules if matches(rule, has_media, text)), None):
+    if next(
+        (rule for rule in cfg.channel_forwarding.ignore_rules if rule.matches(text, has_media)),
+        None,
+    ):
         recent_ignored[sender.id] = time.time()
         return
 
     # Ignore short messages that have no media from users who haven't sent
     # anything useful in a while, as they are unlikely to be useful either.
     for user, ts in list(recent_senders.items()):
-        if ts < time.time() - cfg.channel_ignore.recent_seconds:
+        if ts < time.time() - cfg.channel_forwarding.ignore_recent_seconds:
             del recent_senders[user]
     if (
         sender.id not in recent_senders
         and not has_media
-        and len(text) <= cfg.channel_ignore.length_min_from_silent
+        and len(text) <= cfg.channel_forwarding.ignore_length_min_from_silent
     ):
         return
 
     # Ignore short messages that have no media from recently ignored users,
     # as they are likely to be follow-ups to the original ignored message.
     for user, ts in list(recent_ignored.items()):
-        if ts < time.time() - cfg.channel_ignore.recent_seconds:
+        if ts < time.time() - cfg.channel_forwarding.ignore_recent_seconds:
             del recent_ignored[user]
     if (
         sender.id in recent_ignored
         and not has_media
-        and len(text) <= cfg.channel_ignore.length_min_from_ignored
+        and len(text) <= cfg.channel_forwarding.ignore_length_min_from_ignored
     ):
         return
 
@@ -123,7 +147,7 @@ async def forward_to_channel(bot: Bot, msg: Message):
             raise ReplyNotFound
 
         result = await msg.copy(
-            chat_id=cfg.chats.channel,
+            chat_id=cfg.channel_forwarding.channel,
             reply_markup=make_keyboard(msg),
             reply_to_message_id=row[0],
         )
@@ -134,7 +158,7 @@ async def forward_to_channel(bot: Bot, msg: Message):
             isinstance(ex, BadRequest) and "replied message not found" in str(ex).lower()
         ):
             result = await msg.copy(
-                chat_id=cfg.chats.channel,
+                chat_id=cfg.channel_forwarding.channel,
                 reply_markup=make_keyboard(msg),
             )
             new_msg_id = result.message_id
@@ -151,7 +175,7 @@ async def edit_in_channel(bot: Bot, msg: Message):
     Apply an edit of a spam-checked SOURCE message to its forwarded copy in the CHANNEL.
     """
     # Ignore edits outside SOURCE chats.
-    if msg.chat.id not in cfg.chats.source:
+    if msg.chat.id not in cfg.channel_forwarding.source or not cfg.channel_forwarding.channel:
         return
 
     # Try to find the corresponding message in the channel.
@@ -163,15 +187,18 @@ async def edit_in_channel(bot: Bot, msg: Message):
     text, has_media, _ = parse_message(msg)
 
     # If the message now matches an ignore rule with delete=True, delete it from the channel.
-    if any(rule.delete and matches(rule, has_media, text) for rule in cfg.channel_ignore.rules):
-        await delete_from_channel(bot, row[0])
+    if any(
+        rule.delete and rule.matches(text, has_media)
+        for rule in cfg.channel_forwarding.ignore_rules
+    ):
+        await delete_from_channel(bot, [row[0]])
         return
 
     # Otherwise, update the message in the channel to reflect the edit.
     try:
         if msg.text is not None:
             await bot.edit_message_text(
-                chat_id=cfg.chats.channel,
+                chat_id=cfg.channel_forwarding.channel,
                 message_id=row[0],
                 text=msg.text,
                 entities=msg.entities,
@@ -179,7 +206,7 @@ async def edit_in_channel(bot: Bot, msg: Message):
             )
         elif msg.caption is not None:
             await bot.edit_message_caption(
-                chat_id=cfg.chats.channel,
+                chat_id=cfg.channel_forwarding.channel,
                 message_id=row[0],
                 caption=msg.caption,
                 caption_entities=msg.caption_entities,
@@ -191,7 +218,6 @@ async def edit_in_channel(bot: Bot, msg: Message):
             return
         # If the message was deleted from the channel, remove it from the DB.
         if "message to edit not found" in str(ex).lower():
-            cursor.execute("DELETE FROM messages WHERE id = ?", [row[0]])
-            db.commit()
+            delete_mirror_records([row[0]])
             return
         raise

@@ -18,7 +18,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import logging, sys
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Generator, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, cast
@@ -49,7 +49,7 @@ _message_logger: ContextVar[_PrefixLoggerAdapter | logging.Logger] = ContextVar(
 
 
 @contextmanager
-def message_logging(chat_id: int, msg_id: int) -> Iterator[None]:
+def message_logging(chat_id: int, msg_id: int) -> Generator[None, None, None]:
     """Set a per-message logger that prepends ``[chat:msg]`` to every message logged via `logger`."""
     adapter = _PrefixLoggerAdapter(base_logger, f"[{chat_id}:{msg_id}]")
     token = _message_logger.set(adapter)

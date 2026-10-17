@@ -6,6 +6,7 @@ db_name = "janitor.db"
 
 # Users allowed to add the bot to groups and delete anything from the channel.
 # admins[0] is a super admin that can assign new admins and gets some service messages and error reports.
+# You should usually add more admins at run time with the /admin command.
 admins = [123456789]
 
 # If true, the bot will spam the super admin (admins[0]) with LLM evaluations and other debug messages.
@@ -19,16 +20,11 @@ quiet = false
 admin_name = "your mom"
 
 [chats]
-# Chats used to update the channel (also implies moderated).
-source = [-1001234567890]
-
-# Channel where messages from source are forwarded.
-channel = 0
-
-# Chats that the bot moderates but doesn't forward to the channel.
+# Chats that the bot moderates.
+# This is no longer recommended for use; use the /moderate command instead.
 moderated = [-1001234567890]
 
-# Channel where messages deleted by the bot are forwarded for monitoring.
+# Chat where the bot reports deleted messages, bans and admin actions for monitoring.
 monitor = -1001234567890
 
 # Delete join/leave system messages in moderated chats by default.
@@ -115,7 +111,10 @@ system_prompt = """You are a moderator for a chat group where {purpose}. Your ta
 Almost always spam:
 - Remote job offers with few details and high pay
 - Investment and cryptocurrency promotion
-- Anything in Chinese or Russian referring to earning money or to other Telegram channels
+- Pretending to give away a camera and directing to an email address
+- Anything in Chinese or Russian referring to earning money
+- Any short message in Chinese that mentions a Telegram @username, even if it seems legitimate
+- Short nonsense messages in Chinese
 - Online casinos
 - Pornography
 - "Looking for fun" type romance scams without any details such as date or city
@@ -179,20 +178,28 @@ reasoning_retention_days = 90
 default = "people post cool messages"
 "-1001234567890" = "people post cool messages"
 
-[channel_ignore]
-# Duration for the next two settings.
-recent_seconds = 900 # 15 min
+[channel_forwarding]
+# Chats used to update the channel (also implies moderated).
+source = [-1001234567890]
 
-# Minimum message length to consider "useful" from users that haven't sent useful messages in recent_seconds.
-length_min_from_silent = 15
+# Channel where messages from source are forwarded.
+channel = 0
 
-# Minimum message length to consider "useful" from users that have sent ignored messages in recent_seconds.
-length_min_from_ignored = 20
+# Duration for ignore_length_min_from_*.
+ignore_recent_seconds = 900 # 15 min
 
-# channel_ignore.rules: messages matching any rule are not forwarded to the channel.
+# Minimum message length to consider "useful" from users that haven't sent
+# useful messages within ignore_recent_seconds.
+ignore_length_min_from_silent = 15
+
+# Minimum message length to consider "useful" from users that have sent
+# ignored messages within ignore_recent_seconds.
+ignore_length_min_from_ignored = 20
+
+# channel_forwarding.ignore_rules: messages matching any rule are not forwarded to the channel.
 # Fields:
 #   regex  – case-insensitive pattern
 #   media  – omit (don't care) | true (must have media) | false (must not have media)
 #   delete – if true, forwarded copies are deleted when a message is edited to match this rule
-[[channel_ignore.rules]]
+[[channel_forwarding.ignore_rules]]
 regex = "example"

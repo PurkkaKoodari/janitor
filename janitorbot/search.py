@@ -32,12 +32,12 @@ from janitorbot.db import (
     latest_uncached_check,
     text_hash,
 )
-from janitorbot.spam import parse_message, prepare_llm_check
+from janitorbot.messages import parse_message, prepare_llm_input
 
 
 async def _llm_content_hash(text: str, media_info: str) -> bytes:
     """Return the content hash the message would be cached under."""
-    llm_user_message = cast(str, await prepare_llm_check(text, media_info, force=True))
+    llm_user_message = cast(str, await prepare_llm_input(text, media_info, force=True))
     return content_hash(llm_user_message)
 
 
@@ -122,7 +122,10 @@ async def search_forwarded(bot: Bot, msg: Message) -> bool:
     text, _, media_info = parse_message(msg)
     c_hash = await _llm_content_hash(text, media_info)
 
-    if isinstance(origin, MessageOriginChannel) and origin.chat.id == cfg.chats.channel:
+    if (
+        isinstance(origin, MessageOriginChannel)
+        and origin.chat.id == cfg.channel_forwarding.channel
+    ):
         # The sender and date are the channel's, so only the mirrored message or content can match.
         checks = find_mirrored_checks(origin.message_id)
     else:

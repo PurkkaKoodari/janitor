@@ -149,7 +149,7 @@ def effective_spam_checked_chats() -> frozenset[int]:
 
 
 def effective_member_chats() -> frozenset[int]:
-    return effective_moderated_chats() | {cfg.chats.channel}
+    return effective_moderated_chats() | {cfg.channel_forwarding.channel}
 
 
 def chat_settings(chat_id: int) -> ChatSettings:
@@ -398,14 +398,14 @@ def find_mirrored_checks(channel_msg_id: int) -> list[RecordedCheck]:
         return []
     orig_id, author = row
     # The messages table has no chat ID, so match on the sender in any source chat.
-    placeholders = ", ".join("?" * len(cfg.chats.source))
+    placeholders = ", ".join("?" * len(cfg.channel_forwarding.source))
     cursor.execute(
         f"""
         SELECT {_CHECK_COLUMNS} FROM spam_messages
         WHERE message_id = ? AND user_id = ? AND NOT system AND chat_id IN ({placeholders})
         ORDER BY rowid
         """,
-        [orig_id, author, *cfg.chats.source],
+        [orig_id, author, *cfg.channel_forwarding.source],
     )
     return _group_checks(map(_CheckRow._make, cursor))
 
@@ -534,14 +534,18 @@ def user_message_ids(chat_id: int, user_id: int, *, joins_only: bool = False) ->
     return [row[0] for row in cursor.fetchall()]
 
 
-def pop_mirrored_message_ids(orig_ids: list[int]) -> list[int]:
-    """Remove the channel mirrors of the given source message IDs and return their IDs."""
+def mirrored_message_ids(orig_ids: list[int]) -> list[int]:
+    """Return the IDs of the channel mirrors of the given source message IDs."""
     placeholders = ", ".join("?" * len(orig_ids))
     cursor.execute(f"SELECT id FROM messages WHERE orig_id IN ({placeholders})", orig_ids)
-    ids = [row[0] for row in cursor.fetchall()]
-    cursor.execute(f"DELETE FROM messages WHERE orig_id IN ({placeholders})", orig_ids)
+    return [row[0] for row in cursor.fetchall()]
+
+
+def delete_mirror_records(ids: list[int]) -> None:
+    """Remove the records of the given channel message IDs."""
+    placeholders = ", ".join("?" * len(ids))
+    cursor.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", ids)
     db.commit()
-    return ids
 
 
 def mentioning_message_ids(chat_id: int, user_id: int, mention: str) -> list[int]:

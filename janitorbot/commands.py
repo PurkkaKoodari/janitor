@@ -509,10 +509,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 member = None
                 try:
                     member = await context.bot.get_chat_member(
-                        chat_id=cfg.chats.source[0],  # TODO: multiple sources?
+                        chat_id=cfg.channel_forwarding.source[0],  # TODO: multiple sources?
                         user_id=qry.from_user.id,
                     )
-                except TelegramError:
+                except (TelegramError, IndexError):
                     member = None
                 if (not member) or member.status not in ("creator", "administrator"):
                     # If not, they have no business deleting this message.
@@ -522,7 +522,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     return
 
-        await delete_from_channel(context.bot, msg_id)
+        await delete_from_channel(context.bot, [msg_id])
         await qry.answer(text="Deleted!")
     except Exception:
         logger.error("Error handling callback query", exc_info=True)

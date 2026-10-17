@@ -17,7 +17,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import asyncio, glob, os, re, sys, threading, time
+import asyncio, glob, os, sys, threading, time
 from html import escape
 from typing import Any, cast
 
@@ -58,13 +58,9 @@ from janitorbot.db import (
     purge_old_reasonings,
 )
 from janitorbot.log import logger, message_logging
+from janitorbot.messages import parse_message
 from janitorbot.search import search_forwarded, search_text
-from janitorbot.spam import (
-    attempt_delete_ban,
-    check_spam,
-    parse_message,
-    record_joins,
-)
+from janitorbot.spam import check_spam, record_joins
 
 
 async def process_message(bot: Bot, msg: Message):
@@ -124,36 +120,6 @@ async def process_message(bot: Bot, msg: Message):
             # With search:, never simulate. The admin clearly intends to only search previous verdicts.
             return
 
-    # Check for forwarded special cases of spam, and react to them. If the message is likely spam, don't process it further.
-    if (
-        cfg.spam.forwarded_story
-        and msg.chat.id in effective_moderated_chats()
-        and msg.story
-        and msg.story.chat.id != sender.id
-    ):
-        await attempt_delete_ban(bot, msg, reasoning="Forwarded story")
-        return
-
-    fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
-    if msg.chat.id in effective_moderated_chats() and fwd_from_channel:
-        if cfg.spam.channel_forwarded_with_keyboard and msg.reply_markup:
-            await attempt_delete_ban(
-                bot, msg, reasoning="Forwarded message from channel with inline keyboard"
-            )
-            return
-        if (
-            cfg.spam.channel_forwarded_cyrillic_and_links
-            and text
-            and re.search(cfg.spam.suspicious_link_regex, text)
-            and re.search(r"[\u0400-\u052F]", text, re.I)
-        ):
-            await attempt_delete_ban(
-                bot,
-                msg,
-                reasoning="Forwarded message from channel with Cyrillic and suspicious links",
-            )
-            return
-
     # Check for spam and react to it. If the message is likely spam, don't process it further.
     if not await check_spam(bot, msg):
         return
@@ -181,7 +147,7 @@ async def process_edit(bot: Bot, msg: Message):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.message)
-        app = context.application  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        app = context.application  # fmt: skip # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         with message_logging(msg.chat.id, msg.message_id):
             app.create_task(process_message(context.bot, msg))
     except Exception:
@@ -191,7 +157,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = cast(Message, update.edited_message)
-        app = context.application  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        app = context.application  # fmt: skip # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         with message_logging(msg.chat.id, msg.message_id):
             app.create_task(process_edit(context.bot, msg))
     except Exception:

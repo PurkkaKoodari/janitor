@@ -40,14 +40,15 @@ The bot logic lives in the `janitorbot/` package, split into focused modules. Co
 - `janitorbot/config.py` — Pydantic config models and the `cfg` loaded from `config.toml`
 - `janitorbot/db.py` — SQLite connection, table setup, and the `effective_*` / `chat_purpose` / `chat_mode` helpers
 - `janitorbot/llm.py` — LLM calls and OpenRouter request/response/error handling
-- `janitorbot/spam.py` — message parsing, spam detection, and delete/ban actions
-- `janitorbot/channel.py` — `forward_to_channel` / `edit_in_channel`: forwarding source messages (and edits) to the channel, only after spam checks pass
+- `janitorbot/messages.py` — message parsing and LLM input preparation
+- `janitorbot/channel.py` — bulk message deletion, channel mirror deletion, and `forward_to_channel` / `edit_in_channel`: forwarding source messages (and edits) to the channel, only after spam checks pass
+- `janitorbot/spam.py` — spam detection and delete/ban actions
 - `janitorbot/commands.py` — Telegram command and callback-query handlers
 - `janitorbot/search.py` — admin DM lookups of recorded reasonings: forwarded messages (falling back to simulation if unmatched) and `search:` messages
 - `janitorbot/main.py` — message routing/spam-check orchestration (`process_message` / `process_edit`), the message handlers, auto-restart watcher, handler registration, `main()`
 - `janitor.py` — thin launcher (`from janitorbot.main import main`)
 
-Import chain (acyclic): `log` ← `config` ← `db` ← `llm` ← `spam` ← `channel` ← `commands` ← `search` ← `main`. Module-level side effects (load `cfg`, open DB, build `or_client`) fire in that order.
+Import chain (acyclic): `log` ← `config` ← `db` ← `llm` ← `messages` ← `channel` ← `spam` ← `commands` ← `search` ← `main`. Module-level side effects (load `cfg`, open DB, build `or_client`) fire in that order.
 
 ### Chat roles
 
@@ -102,4 +103,4 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 
 ### Config structure (`config.toml`)
 
-Key sections: `[chats]`, `[spam]`, `[established_user]`, `[new_user]`, `[llm]`, `[llm.chat_purposes]`, `[channel_ignore]`. Validated via Pydantic models at startup. `channel_ignore.rules` are regex-based ignore rules for the channel forwarding step.
+Key sections: `[chats]`, `[spam]`, `[established_user]`, `[new_user]`, `[llm]`, `[llm.chat_purposes]`, `[channel_forwarding]`. Validated via Pydantic models at startup.

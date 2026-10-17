@@ -22,31 +22,40 @@ from functools import cached_property
 from typing import Literal
 
 from openrouter.components import Effort
-from pydantic import BaseModel, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, computed_field, field_validator
 
 from janitorbot.log import logger
 
 
-class Rule(BaseModel):
+class StrictModel(BaseModel):
+    """Base for config models that rejects unknown keys."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class Rule(StrictModel):
     regex: str
     # None means "don't care", True means "must have media", False means "must not have media"
     media: bool | None = None
     # if True, messages matching this rule will be deleted if they are edited to match, even if they previously didn't match
     delete: bool = False
 
+    def matches(self, text: str, has_media: bool) -> bool:
+        if self.media is not None and has_media != self.media:
+            return False
+        return bool(re.search(self.regex, text, re.I))
+
 
 Mode = Literal["test", "delete", "ban"]
 
 
-class ChatsConfig(BaseModel):
-    source: list[int]
-    channel: int
+class ChatsConfig(StrictModel):
     moderated: list[int]
     monitor: int
     delete_join_leave: bool = False
 
 
-class SpamConfig(BaseModel):
+class SpamConfig(StrictModel):
     regex: list[str]
     mode: Mode = "ban"
     forwarded_story: bool = True
@@ -55,19 +64,19 @@ class SpamConfig(BaseModel):
     suspicious_link_regex: str = r"@\w+|https?://t\.me|https?://vk\."
 
 
-class EstablishedUserConfig(BaseModel):
+class EstablishedUserConfig(StrictModel):
     min_days: float = 7
     min_nonspam_messages: int = 10
     ban_threshold_days: float = 1
     ban_threshold_messages: int = 3
 
 
-class NewUserConfig(BaseModel):
+class NewUserConfig(StrictModel):
     max_days: float = 2
     max_nonspam_messages: int = 2
 
 
-class LLMConfig(BaseModel):
+class LLMConfig(StrictModel):
     openrouter_key: str
     model: str
     temperature: float = 0.5
@@ -99,13 +108,15 @@ class LLMConfig(BaseModel):
         return v
 
 
-class ChannelIgnoreConfig(BaseModel):
-    recent_seconds: int
-    length_min_from_silent: int
-    length_min_from_ignored: int
-    rules: list[Rule]
+class ChannelForwardingConfig(StrictModel):
+    source: list[int] = []
+    channel: int = 0
+    ignore_recent_seconds: int = 900
+    ignore_length_min_from_silent: int = 15
+    ignore_length_min_from_ignored: int = 20
+    ignore_rules: list[Rule] = []
 
-    @field_validator("rules", mode="after")
+    @field_validator("ignore_rules", mode="after")
     @classmethod
     def filter_invalid_rules(cls, v: list[Rule]) -> list[Rule]:
         valid: list[Rule] = []
@@ -118,7 +129,7 @@ class ChannelIgnoreConfig(BaseModel):
         return valid
 
 
-class Config(BaseModel):
+class Config(StrictModel):
     bot_token: str
     db_name: str
     admins: list[int]
@@ -130,7 +141,7 @@ class Config(BaseModel):
     new_user: NewUserConfig = NewUserConfig()
     chats: ChatsConfig
     llm: LLMConfig
-    channel_ignore: ChannelIgnoreConfig
+    channel_forwarding: ChannelForwardingConfig = ChannelForwardingConfig()
 
     @field_validator("bot_token")
     @classmethod
@@ -147,7 +158,7 @@ class Config(BaseModel):
     @cached_property
     def moderated_chats(self) -> frozenset[int]:
         """Source and moderated chats — where spam moderation is applied."""
-        return frozenset(self.chats.source) | frozenset(self.chats.moderated)
+        return frozenset(self.chats.moderated) | frozenset(self.channel_forwarding.source)
 
     @computed_field
     @cached_property
@@ -159,7 +170,7 @@ class Config(BaseModel):
     @cached_property
     def member_chats(self) -> frozenset[int]:
         """Moderated chats plus the channel — chats the bot is intentionally a member of."""
-        return self.moderated_chats | {self.chats.channel}
+        return self.moderated_chats | {self.channel_forwarding.channel}
 
 
 with open("config.toml", "rb") as file:
