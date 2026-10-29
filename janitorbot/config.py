@@ -40,11 +40,6 @@ class Rule(StrictModel):
     # if True, messages matching this rule will be deleted if they are edited to match, even if they previously didn't match
     delete: bool = False
 
-    def matches(self, text: str, has_media: bool) -> bool:
-        if self.media is not None and has_media != self.media:
-            return False
-        return bool(re.search(self.regex, text, re.I))
-
 
 Mode = Literal["test", "delete", "ban"]
 

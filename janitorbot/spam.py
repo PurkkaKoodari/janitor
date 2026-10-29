@@ -46,11 +46,12 @@ from janitorbot.db import (
 )
 from janitorbot.llm import DeferredLLMError, LLMError, llm_check
 from janitorbot.log import logger
-from janitorbot.messages import extract_mentions, parse_message, prepare_llm_input
+from janitorbot.messages import ParsedMessage, extract_mentions, prepare_llm_input
 
 
 def record_checked_message(
     msg: Message,
+    parsed: ParsedMessage,
     spam: bool,
     *,
     sp_hash: bytes | None = None,
@@ -62,8 +63,7 @@ def record_checked_message(
     Store the result of spam checking the message in the database, with either the LLM samples or
     the non-LLM reasoning.
     """
-    text, _, _ = parse_message(msg)
-    t_hash = text_hash(text)
+    t_hash = text_hash(parsed.text)
     record_message(
         MessageRecord(
             chat_id=msg.chat.id,
@@ -107,7 +107,7 @@ def sampled_prob_range(samples: list[float]) -> str:
     return f" ({min(samples):.2f}\u2026{max(samples):.2f})"
 
 
-async def check_spam(bot: Bot, msg: Message) -> bool:
+async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
     """
     Check the message for spam and react to spam.
 
@@ -115,9 +115,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     """
     chat_id = msg.chat.id
     sender = cast(User, msg.from_user)
-    from_admin = sender.id in effective_admins()
     is_evaluation = msg.chat.id in effective_admins()
-    text, _, media_info = parse_message(msg)
 
     # Check for forwarded special cases of spam, and react to them.
     # If the message is likely spam, don't process it further.
@@ -127,68 +125,60 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         and msg.story
         and msg.story.chat.id != sender.id
     ):
-        await attempt_delete_ban(bot, msg, reasoning="Forwarded story")
+        await attempt_delete_ban(bot, msg, parsed, reasoning="Forwarded story")
         return False
 
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
     if msg.chat.id in effective_moderated_chats() and fwd_from_channel:
         if cfg.spam.channel_forwarded_with_keyboard and msg.reply_markup:
             await attempt_delete_ban(
-                bot, msg, reasoning="Forwarded message from channel with inline keyboard"
+                bot, msg, parsed, reasoning="Forwarded message from channel with inline keyboard"
             )
             return False
         if (
             cfg.spam.channel_forwarded_cyrillic_and_links
-            and text
-            and re.search(cfg.spam.suspicious_link_regex, text)
-            and re.search(r"[\u0400-\u052F]", text, re.I)
+            and parsed.text
+            and re.search(cfg.spam.suspicious_link_regex, parsed.text)
+            and re.search(r"[\u0400-\u052F]", parsed.text, re.I)
         ):
             await attempt_delete_ban(
                 bot,
                 msg,
+                parsed,
                 reasoning="Forwarded message from channel with Cyrillic and suspicious links",
             )
             return False
 
     # Also check for spam regexes. These can save cost and time by avoiding LLM checks for obvious spam.
-    if chat_id in effective_moderated_chats() and text and re.search(cfg.spam_pattern, text, re.I):
+    if (
+        chat_id in effective_moderated_chats()
+        and parsed.text
+        and re.search(cfg.spam_pattern, parsed.text, re.I)
+    ):
         logger.info("Message matches spam regex, banning without LLM check!")
         matching_regex = next(
-            (regex for regex in cfg.spam.regex if re.search(regex, text, re.I)), None
+            (regex for regex in cfg.spam.regex if re.search(regex, parsed.text, re.I)), None
         )
-        await attempt_delete_ban(bot, msg, reasoning=f"Matched spam regex: {matching_regex}")
+        await attempt_delete_ban(
+            bot, msg, parsed, reasoning=f"Matched spam regex: {matching_regex}"
+        )
         return False
 
     # For other messages, run the LLM check and then process them in the after function.
-    # Allow admins to override the purpose.
-    if from_admin and text.startswith("purpose: ") and "\n" in text:
-        purpose, _, text = text[len("purpose: ") :].partition("\n")
+    if parsed.purpose is not None:
+        purpose = parsed.purpose
         logger.info("Using custom purpose from admin: %s", purpose)
     else:
         purpose = chat_purpose(msg.chat.id)
 
-    # Allow admins to bypass the verdict cache when evaluating.
-    reevaluate = is_evaluation and text.startswith("reeval:\n")
-    if reevaluate:
-        text = text[len("reeval:\n") :]
+    if parsed.reevaluate:
         logger.info("Reevaluation requested, bypassing verdict cache.")
 
     system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
 
-    llm_user_message = await prepare_llm_input(text, media_info)
+    llm_user_message = await prepare_llm_input(parsed)
 
-    # If the message has too little data to check, skip the LLM and assume it's not spam.
-    if llm_user_message is None:
-        logger.info("Short message, skipping LLM check!")
-        record_checked_message(msg, False, reasoning="Short message, skipped LLM check")
-        if is_evaluation:
-            await msg.reply_text(
-                f"The message is short enough (< {cfg.llm.min_length} characters) to be assumed not spam.",
-                do_quote=True,
-            )
-        return True
-
-    if from_admin and text.startswith("debug:\n"):
+    if parsed.debug:
         logger.info("Debug mode, sending system prompt to admin.")
         await bot.send_message(
             chat_id=sender.id,
@@ -197,10 +187,21 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         )
         return True
 
+    # If the message has too little data to check, skip the LLM and assume it's not spam.
+    if llm_user_message is None:
+        logger.info("Short message, skipping LLM check!")
+        record_checked_message(msg, parsed, False, reasoning="Short message, skipped LLM check")
+        if is_evaluation:
+            await msg.reply_text(
+                f"The message is short enough (< {cfg.llm.min_length} characters) to be assumed not spam.",
+                do_quote=True,
+            )
+        return True
+
     # Reuse the verdict of an identical earlier message checked with the same system prompt.
     sp_hash = system_prompt_hash(system_prompt)
     c_hash = content_hash(llm_user_message)
-    cached_probs = [] if reevaluate else cached_verdict(sp_hash, c_hash)
+    cached_probs = [] if parsed.reevaluate else cached_verdict(sp_hash, c_hash)
 
     # Now run the LLM check and react to the result.
     try:
@@ -218,7 +219,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
             async def report_error(error: LLMError) -> None:
                 # Record fatal errors in the database.
                 if error.fatal:
-                    record_checked_message(msg, False, c_hash=c_hash, reasoning=str(error))
+                    record_checked_message(msg, parsed, False, c_hash=c_hash, reasoning=str(error))
                 # Report to the super admin if configured.
                 reported_to = None
                 if not cfg.quiet and (
@@ -244,13 +245,14 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
         # Store the verdict.
         spam = prob >= cfg.llm.threshold
-        record_checked_message(msg, spam, sp_hash=sp_hash, c_hash=c_hash, samples=samples)
+        record_checked_message(msg, parsed, spam, sp_hash=sp_hash, c_hash=c_hash, samples=samples)
 
         if spam:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
             await attempt_delete_ban(
                 bot,
                 msg,
+                parsed,
                 reasoning=reasoning,
                 prob=prob,
                 sample_probs=sample_probs,
@@ -321,6 +323,7 @@ async def ban_user(bot: Bot, msg: Message, user: User) -> None:
 async def attempt_delete_ban(
     bot: Bot,
     msg: Message,
+    parsed: ParsedMessage,
     reasoning: str,
     prob: float | None = None,
     sample_probs: list[float] = [],
@@ -332,7 +335,7 @@ async def attempt_delete_ban(
     record their samples themselves.
     """
     if not sample_probs:
-        record_checked_message(msg, True, reasoning=reasoning)
+        record_checked_message(msg, parsed, True, reasoning=reasoning)
 
     sender = cast(User, msg.from_user)
     caller = msg.guest_bot_caller_user

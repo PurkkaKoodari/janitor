@@ -19,6 +19,7 @@
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import cast
 
@@ -27,8 +28,123 @@ import httpx
 from telegram import Message, MessageEntity
 from telegram.helpers import escape_markdown
 
-from janitorbot.config import cfg
+from janitorbot.config import Rule, cfg
 from janitorbot.log import logger
+
+# Commands accepted in admin DMs.
+COMMANDS = frozenset({"evalpurpose", "reeval", "debug", "search"})
+
+# A command line is either "/cmd args" (optionally "/cmd@bot args") or "cmd: args".
+_COMMAND_RE = re.compile(
+    r"(?:/(?P<slash>[a-z]+)(?:@\w+)?(?=\s|$)|(?P<colon>[a-z]+):)\s*(?P<args>.*)"
+)
+
+
+class OverrideError(Exception):
+    """Invalid admin commands, replied to the sender."""
+
+
+@dataclass
+class ParsedMessage:
+    """
+    A message's text and attachment description. For admin DMs, also the admin commands parsed
+    from its leading lines, in which case the text is the remaining body.
+    """
+
+    purpose: str | None = None
+    reevaluate: bool = False
+    debug: bool = False
+    search: bool = False
+    text: str = ""
+    media: str = ""
+
+    @property
+    def has_overrides(self) -> bool:
+        """Return True if any evaluation overrides are set."""
+        return self.purpose is not None or self.reevaluate or self.debug
+
+    @property
+    def bare(self) -> bool:
+        """Return True if the message has no text or attachments (besides any commands)."""
+        return not self.text.strip() and not self.media
+
+    def matches(self, rule: Rule) -> bool:
+        """Return True if the message matches the channel forwarding ignore rule."""
+        if rule.media is not None and bool(self.media) != rule.media:
+            return False
+        return bool(re.search(rule.regex, self.text, re.I))
+
+    def combine(self, previous: "ParsedMessage | None") -> "ParsedMessage":
+        """Return both sets of overrides together, preferring the current (later) set."""
+        if not previous:
+            return self
+        # Search cancels any pending evaluation commands.
+        if self.search:
+            return self
+        exclusive = self if self.reevaluate or self.debug else previous
+        return ParsedMessage(
+            purpose=self.purpose if self.purpose is not None else previous.purpose,
+            reevaluate=exclusive.reevaluate,
+            debug=exclusive.debug,
+            # Evaluation commands cancel a pending search.
+            search=previous.search and not self.has_overrides,
+            text=self.text,
+            media=self.media,
+        )
+
+    def describe_overrides(self) -> str:
+        """Describe the applied overrides to the admin."""
+        lines: list[str] = []
+        if self.purpose is not None:
+            lines.append(f'Overriding purpose to "{self.purpose}" for evaluation.')
+        if self.reevaluate:
+            lines.append("Ignoring cached verdicts and reevaluating.")
+        if self.debug:
+            lines.append("Showing LLM prompt instead of evaluating.")
+        return "\n".join(lines)
+
+    def parse_admin_commands(self) -> "ParsedMessage":
+        """
+        Return a copy with leading command lines parsed from an admin message. Evaluation commands
+        can be given in any order; ``search`` takes the rest of the message as its content.
+        """
+        parsed = ParsedMessage(media=self.media)
+        seen: set[str] = set()
+        lines = self.text.split("\n")
+        for index, line in enumerate(lines):
+            match = _COMMAND_RE.fullmatch(line)
+            name = match and (match["slash"] or match["colon"])
+            if not match or name not in COMMANDS:
+                # Treat rest of message as body.
+                parsed.text = "\n".join(lines[index:])
+                return parsed
+            args = match["args"].strip()
+
+            if name == "search":
+                if parsed.has_overrides:
+                    raise OverrideError("/search cannot be combined with evaluation commands.")
+                parsed.search = True
+                parsed.text = "\n".join(([args] if args else []) + lines[index + 1 :])
+                return parsed
+
+            if name in seen:
+                raise OverrideError(f"/{name} was given more than once.")
+            seen.add(name)
+
+            if name == "evalpurpose":
+                if not args:
+                    raise OverrideError("Usage: /evalpurpose <purpose>")
+                parsed.purpose = args
+            elif args:
+                raise OverrideError(f"/{name} does not take arguments.")
+            elif name == "reeval":
+                parsed.reevaluate = True
+            else:
+                parsed.debug = True
+
+            if parsed.reevaluate and parsed.debug:
+                raise OverrideError("/reeval and /debug cannot be combined.")
+        return parsed
 
 
 def expand_links(text: str, entities: Sequence[MessageEntity]) -> str:
@@ -63,8 +179,8 @@ def expand_links(text: str, entities: Sequence[MessageEntity]) -> str:
     return "".join(parts)
 
 
-def parse_message(msg: Message) -> tuple[str, bool, str]:
-    """Return (text, has_media, media_info) for the message."""
+def parse_message(msg: Message) -> ParsedMessage:
+    """Return the message's text, with links expanded, and attachment description."""
     # Describe any attachments to the message.
     if msg.contact is not None:  # Contact → "contact: <name>"
         name = f"{msg.contact.first_name or ""} {msg.contact.last_name or ""}".strip()
@@ -82,8 +198,6 @@ def parse_message(msg: Message) -> tuple[str, bool, str]:
     else:
         media_info = ""
 
-    has_media = bool(media_info)
-
     # Expand link entities in the message to Markdown.
     if msg.text is not None:
         text = expand_links(msg.text, msg.entities)
@@ -97,7 +211,7 @@ def parse_message(msg: Message) -> tuple[str, bool, str]:
     if preview and preview.url and str(preview.url) not in text:
         text += f"\n{preview.url}"
 
-    return text, has_media, media_info
+    return ParsedMessage(text=text, media=media_info)
 
 
 def extract_mentions(msg: Message) -> list[str]:
@@ -162,7 +276,7 @@ CJK_REGEX = re.compile(r"[\u4E00-\u9FFF]")
 TME_LINK_REGEX = re.compile(r"https?://t\.me/[^\s)\]]+")
 
 
-async def prepare_llm_input(text: str, media_info: str, *, force: bool = False) -> str | None:
+async def prepare_llm_input(parsed: ParsedMessage, *, force: bool = False) -> str | None:
     """Build the user message content to send to the LLM, embedding attachment info and any
     linked Telegram post description as an <attachments> tag, as described in the system
     prompt's <message_format> section.
@@ -170,6 +284,8 @@ async def prepare_llm_input(text: str, media_info: str, *, force: bool = False) 
     Return None if the message has too little data to be worth checking via LLM, unless forced."""
     # A media with a description always gets forwarded to the LLM.
     # This is checked via formatting, as any media_info usually exceeds cfg.llm.min_length.
+    text = parsed.text
+    media_info = parsed.media
     force_llm = force or "\n\n" in media_info or ":" in media_info
 
     tme_link = TME_LINK_REGEX.search(text)

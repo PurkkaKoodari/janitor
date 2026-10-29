@@ -32,7 +32,7 @@ from telegram.error import BadRequest, TelegramError
 from janitorbot.config import cfg
 from janitorbot.db import cursor, db, delete_mirror_records, mirrored_message_ids
 from janitorbot.log import logger
-from janitorbot.messages import parse_message
+from janitorbot.messages import ParsedMessage
 
 recent_senders: dict[int, float] = {}
 recent_ignored: dict[int, float] = {}
@@ -82,7 +82,7 @@ async def delete_mirrors(bot: Bot, chat_id: int, message_ids: list[int]) -> None
     await delete_from_channel(bot, mirrored_message_ids(message_ids))
 
 
-async def forward_to_channel(bot: Bot, msg: Message):
+async def forward_to_channel(bot: Bot, msg: Message, parsed: ParsedMessage) -> None:
     """
     Forward a spam-checked SOURCE message to the CHANNEL, applying ignore and recency heuristics.
     """
@@ -94,15 +94,13 @@ async def forward_to_channel(bot: Bot, msg: Message):
     if msg.chat_id not in cfg.channel_forwarding.source or not cfg.channel_forwarding.channel:
         return
 
-    text, has_media, _ = parse_message(msg)
-
     # Ignore messages that have no text and no media, as they are unlikely to be useful.
-    if not text and not has_media:
+    if parsed.bare:
         return
 
     # Ignore messages that match ignore rules, and mark the user as a dibser.
     if next(
-        (rule for rule in cfg.channel_forwarding.ignore_rules if rule.matches(text, has_media)),
+        (rule for rule in cfg.channel_forwarding.ignore_rules if parsed.matches(rule)),
         None,
     ):
         recent_ignored[sender.id] = time.time()
@@ -115,8 +113,8 @@ async def forward_to_channel(bot: Bot, msg: Message):
             del recent_senders[user]
     if (
         sender.id not in recent_senders
-        and not has_media
-        and len(text) <= cfg.channel_forwarding.ignore_length_min_from_silent
+        and not parsed.media
+        and len(parsed.text) <= cfg.channel_forwarding.ignore_length_min_from_silent
     ):
         return
 
@@ -127,8 +125,8 @@ async def forward_to_channel(bot: Bot, msg: Message):
             del recent_ignored[user]
     if (
         sender.id in recent_ignored
-        and not has_media
-        and len(text) <= cfg.channel_forwarding.ignore_length_min_from_ignored
+        and not parsed.media
+        and len(parsed.text) <= cfg.channel_forwarding.ignore_length_min_from_ignored
     ):
         return
 
@@ -170,7 +168,7 @@ async def forward_to_channel(bot: Bot, msg: Message):
         db.commit()
 
 
-async def edit_in_channel(bot: Bot, msg: Message):
+async def edit_in_channel(bot: Bot, msg: Message, parsed: ParsedMessage) -> None:
     """
     Apply an edit of a spam-checked SOURCE message to its forwarded copy in the CHANNEL.
     """
@@ -184,13 +182,8 @@ async def edit_in_channel(bot: Bot, msg: Message):
     if not row:
         return
 
-    text, has_media, _ = parse_message(msg)
-
     # If the message now matches an ignore rule with delete=True, delete it from the channel.
-    if any(
-        rule.delete and rule.matches(text, has_media)
-        for rule in cfg.channel_forwarding.ignore_rules
-    ):
+    if any(rule.delete and parsed.matches(rule) for rule in cfg.channel_forwarding.ignore_rules):
         await delete_from_channel(bot, [row[0]])
         return
 

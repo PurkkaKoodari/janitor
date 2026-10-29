@@ -32,12 +32,12 @@ from janitorbot.db import (
     latest_uncached_check,
     text_hash,
 )
-from janitorbot.messages import parse_message, prepare_llm_input
+from janitorbot.messages import ParsedMessage, prepare_llm_input
 
 
-async def _llm_content_hash(text: str, media_info: str) -> bytes:
+async def _llm_content_hash(parsed: ParsedMessage) -> bytes:
     """Return the content hash the message would be cached under."""
-    llm_user_message = cast(str, await prepare_llm_input(text, media_info, force=True))
+    llm_user_message = cast(str, await prepare_llm_input(parsed, force=True))
     return content_hash(llm_user_message)
 
 
@@ -109,7 +109,7 @@ async def reply_checks(bot: Bot, msg: Message, checks: list[RecordedCheck]) -> N
         await msg.reply_text(reply)
 
 
-async def search_forwarded(bot: Bot, msg: Message) -> bool:
+async def search_forwarded(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
     """
     Reply to a message forwarded by an admin with the recorded checks of the original message.
 
@@ -119,8 +119,7 @@ async def search_forwarded(bot: Bot, msg: Message) -> bool:
     """
     origin = msg.forward_origin
     assert origin is not None
-    text, _, media_info = parse_message(msg)
-    c_hash = await _llm_content_hash(text, media_info)
+    c_hash = await _llm_content_hash(parsed)
 
     if (
         isinstance(origin, MessageOriginChannel)
@@ -159,17 +158,16 @@ async def search_forwarded(bot: Bot, msg: Message) -> bool:
     return True
 
 
-async def search_text(bot: Bot, msg: Message, text: str) -> None:
+async def search_text(bot: Bot, msg: Message, parsed: ParsedMessage) -> None:
     """
-    Reply to a ``search:`` message with the latest uncached LLM check of the same content, or of
+    Reply to a ``/search`` message with the latest uncached LLM check of the same content, or of
     the same text if the attachments differ, or failing that, the latest non-LLM verdict of the
     same text.
     """
-    _, _, media_info = parse_message(msg)
-    c_hash = await _llm_content_hash(text, media_info)
+    c_hash = await _llm_content_hash(parsed)
     check = latest_uncached_check(c_hash=c_hash)
-    if check is None and text.strip():
-        t_hash = text_hash(text)
+    if check is None and parsed.text.strip():
+        t_hash = text_hash(parsed.text)
         # No match with the same attachments, but perhaps the query is missing some.
         check = latest_uncached_check(c_hash=t_hash, text_only=True)
         if check is None:

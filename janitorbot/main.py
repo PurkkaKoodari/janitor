@@ -28,13 +28,13 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ContextTypes,
     filters,
 )
 
 from janitorbot.channel import edit_in_channel, forward_to_channel
 from janitorbot.commands import (
     AdminFilter,
+    Context,
     handle_admin,
     handle_callback_query,
     handle_chats,
@@ -58,12 +58,79 @@ from janitorbot.db import (
     purge_old_reasonings,
 )
 from janitorbot.log import logger, message_logging
-from janitorbot.messages import parse_message
+from janitorbot.messages import OverrideError, ParsedMessage, parse_message
+from janitorbot.state import (
+    PENDING_TIMEOUT_MINUTES,
+    clear_pending,
+    get_pending,
+    set_pending,
+)
 from janitorbot.search import search_forwarded, search_text
 from janitorbot.spam import check_spam, record_joins
 
 
-async def process_message(bot: Bot, msg: Message):
+async def process_admin_commands(context: Context, msg: Message) -> ParsedMessage | None:
+    """
+    Parse the message. In admin DMs, also handle its leading command lines and the admin's pending
+    commands.
+
+    Returns the parsed message with any evaluation overrides to spam check, or None if the message
+    was fully handled.
+    """
+    parsed = parse_message(msg)
+
+    # Commands only affect admin DMs.
+    if msg.chat.type != "private" or msg.chat.id not in effective_admins():
+        return parsed
+
+    # Admin DMs always have user data present.
+    user_data = cast(dict[Any, Any], context.user_data)
+
+    # Forwarded content never contains commands.
+    if not msg.forward_origin:
+        try:
+            parsed = parsed.parse_admin_commands()
+        except OverrideError as e:
+            await msg.reply_text(str(e), do_quote=True)
+            return None
+
+    parsed = parsed.combine(get_pending(user_data))
+
+    clear_pending(user_data)
+    if parsed.search:
+        if parsed.bare:
+            # Search without a message: store and wait for the next message to apply the search to.
+            set_pending(user_data, parsed)
+            await msg.reply_text(
+                f"Send the message content to search for within {PENDING_TIMEOUT_MINUTES} minutes.",
+                do_quote=True,
+            )
+        else:
+            # Search with a message.
+            await search_text(context.bot, msg, parsed)
+        # With /search, never simulate. The admin clearly intends to only search previous verdicts.
+        return None
+    elif parsed.has_overrides and parsed.bare:
+        # Overrides without a body: store and wait for the next message to apply them to.
+        set_pending(user_data, parsed)
+        await msg.reply_text(
+            f"{parsed.describe_overrides()}\n"
+            f"This will apply to your next message within {PENDING_TIMEOUT_MINUTES} minutes.",
+            do_quote=True,
+        )
+        return None
+    elif msg.forward_origin and not parsed.has_overrides:
+        # With no overrides, search for forwarded messages. If no recorded verdict was found for
+        # the forwarded message, fall back to simulation.
+        if await search_forwarded(context.bot, msg, parsed):
+            return None
+
+    if parsed.has_overrides:
+        await msg.reply_text(parsed.describe_overrides()[:4095], do_quote=True)
+    return parsed
+
+
+async def process_message(context: Context, msg: Message):
     """
     Route an incoming message: handle the bot being added to a chat, run spam checks, and
     forward the message to the CHANNEL only once it has passed all spam checks.
@@ -71,14 +138,14 @@ async def process_message(bot: Bot, msg: Message):
     sender = cast(User, msg.from_user)
 
     # If the bot was just added to a new chat, check if it's a chat we want to be in.
-    if msg.new_chat_members and any(user.id == bot.id for user in msg.new_chat_members):
+    if msg.new_chat_members and any(user.id == context.bot.id for user in msg.new_chat_members):
         # If the chat is not known and the person who added the bot is not an admin, leave the chat.
         if msg.chat.id not in effective_member_chats() and sender.id not in effective_admins():
             await msg.chat.leave()
         elif sender.id in effective_admins():
             # Otherwise, send the chat id to the admins so they can add it to the config.
             monitor = cfg.chats.monitor or sender.id
-            await bot.send_message(
+            await context.bot.send_message(
                 chat_id=monitor,
                 text=f'{escape(sender.name)} added the bot to a new chat "{escape(msg.chat.effective_name or "")}" (ID <code>{msg.chat.id}</code>).',
                 parse_mode="HTML",
@@ -106,29 +173,20 @@ async def process_message(bot: Bot, msg: Message):
                 logger.warning("Failed to delete join/leave message", exc_info=True)
         return
 
-    text, _, _ = parse_message(msg)
-
-    # Admins can look up the recorded reasoning for a message instead of simulating it.
-    if msg.chat.type == "private" and msg.chat.id in effective_admins():
-        if msg.forward_origin:
-            # Fall back to simulation if no recorded verdict was found for the forwarded message.
-            if await search_forwarded(bot, msg):
-                return
-        elif text.startswith("search:\n"):
-            text = text[len("search:\n") :]
-            await search_text(bot, msg, text)
-            # With search:, never simulate. The admin clearly intends to only search previous verdicts.
-            return
+    # Parse the message and handle commands in admin DMs.
+    parsed = await process_admin_commands(context, msg)
+    if parsed is None:
+        return
 
     # Check for spam and react to it. If the message is likely spam, don't process it further.
-    if not await check_spam(bot, msg):
+    if not await check_spam(context.bot, msg, parsed):
         return
 
     # The message passed all spam checks; hand it off to the channel forwarding step.
-    await forward_to_channel(bot, msg)
+    await forward_to_channel(context.bot, msg, parsed)
 
 
-async def process_edit(bot: Bot, msg: Message):
+async def process_edit(context: Context, msg: Message):
     """
     Run spam checks on an edited message, then apply the edit to its CHANNEL copy.
     """
@@ -136,30 +194,40 @@ async def process_edit(bot: Bot, msg: Message):
     if msg.chat.id not in effective_spam_checked_chats():
         return
 
-    # Check for spam and react to it. If the message is likely spam, don't process it further.
-    if not await check_spam(bot, msg):
-        return
+    # Parse the message. No admin commands are handled in edits.
+    parsed = parse_message(msg)
+
+    if msg.chat.id in effective_admins():
+        # Don't recheck admin edits, as it makes the conversation confusing.
+        await msg.reply_text(
+            "Edited messages in DMs are not rechecked. If you want to recheck, please send the message again.",
+            do_quote=True,
+        )
+    else:
+        # Check for spam and react to it. If the message is likely spam, don't process it further.
+        if not await check_spam(context.bot, msg, parsed):
+            return
 
     # The edit passed all spam checks; hand it off to the channel edit step.
-    await edit_in_channel(bot, msg)
+    await edit_in_channel(context.bot, msg, parsed)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: Context):
     try:
         msg = cast(Message, update.message)
         app = context.application  # fmt: skip # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         with message_logging(msg.chat.id, msg.message_id):
-            app.create_task(process_message(context.bot, msg))
+            app.create_task(process_message(context, msg))
     except Exception:
         logger.error("Error handling message", exc_info=True)
 
 
-async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_edited_message(update: Update, context: Context):
     try:
         msg = cast(Message, update.edited_message)
         app = context.application  # fmt: skip # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         with message_logging(msg.chat.id, msg.message_id):
-            app.create_task(process_edit(context.bot, msg))
+            app.create_task(process_edit(context, msg))
     except Exception:
         logger.error("Error handling edited message", exc_info=True)
 

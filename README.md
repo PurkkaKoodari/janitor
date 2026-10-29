@@ -121,16 +121,15 @@ If the bot can't find the original check, it says so and checks the message agai
 
 You can also forward deleted spam from the monitor chat.
 
-### `search:`
+### `/search`
 
-To look up a message you can't forward, for example because it was deleted, put `search:` alone on the first line and paste the message text below it:
+To look up a message you can't forward, for example because it was deleted, send `/search` followed by the message text:
 
 ```
-search:
-Earn $500 a day from home, DM me!
+/search Earn $500 a day from home, DM me!
 ```
 
-The bot replies with the most recent check of a message with the same text. A `search:` lookup never runs a new check.
+The bot replies with the most recent check of a message with the same text. A `/search` lookup never runs a new check.
 
 ### Simulating a message
 
@@ -138,34 +137,11 @@ Any other message you send to the bot privately is checked as if it had been pos
 
 Messages shorter than `llm.min_length` aren't sent to the AI at all.
 
-Simulations use the default purpose. To test a group's purpose, put it on the first line:
+The following commands change how the next message you send is simulated. You can combine them, except `/reeval` with `/debug`, and the bot confirms which ones are in effect.
 
-```
-purpose: people sell and give away used furniture in Helsinki
-Selling my old sofa, 20€, pick up in Kallio
-```
-
-### `reeval:`
-
-Identical messages reuse earlier verdicts instead of asking the AI again. To force a fresh check of a simulated message, put `reeval:` on the first line:
-
-```
-reeval:
-Selling my old sofa, 20€, pick up in Kallio
-```
-
-You can combine this with `purpose:` by putting the `purpose:` line first.
-
-### `debug:`
-
-To see exactly what the AI receives without running a check, put `debug:` on the first line:
-
-```
-debug:
-Selling my old sofa, 20€, pick up in Kallio
-```
-
-The bot replies with the full instructions and message it would send to the AI. You can combine this with `purpose:` by putting the `purpose:` line first.
+- `/evalpurpose <purpose>`: simulate with a different purpose than the default, for example `/evalpurpose people sell and give away used furniture` to test a group's purpose.
+- `/reeval`: identical messages normally reuse earlier verdicts instead of asking the AI again. This forces a fresh check.
+- `/debug`: instead of running a check, reply with the full instructions and message the bot would send to the AI.
 
 ### Debug mode
 

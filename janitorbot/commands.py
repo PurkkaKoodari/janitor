@@ -35,7 +35,7 @@ from telegram import (
     User,
 )
 from telegram.error import TelegramError
-from telegram.ext import ContextTypes, filters
+from telegram.ext import CallbackContext, ExtBot, filters
 
 from janitorbot.channel import delete_from_channel
 from janitorbot.config import Mode, cfg
@@ -55,6 +55,7 @@ from janitorbot.db import (
     set_chat_setting,
 )
 from janitorbot.log import logger
+from janitorbot.state import clear_pending
 
 
 class CommandError(Exception):
@@ -68,15 +69,28 @@ class AdminFilter(filters.MessageFilter):
         return message.from_user is not None and message.from_user.id in effective_admins()
 
 
+type Context = CallbackContext[ExtBot[None], dict[Any, Any], dict[Any, Any], dict[Any, Any]]
 type CommandCallback = Callable[[Message, User, list[str], Bot], Coroutine[Any, Any, None]]
-type CommandHandlerCallback = Callable[
-    [Update, ContextTypes.DEFAULT_TYPE], Coroutine[Any, Any, None]
-]
+type CommandHandlerCallback = Callable[[Update, Context], Coroutine[Any, Any, None]]
 
 
 ADMIN_COMMANDS: list[BotCommand] = []
 SUPERADMIN_COMMANDS: list[BotCommand] = []
 COMMAND_USAGES: dict[str, str] = {}
+
+
+def list_command(
+    name: str,
+    description: str,
+    usage: str = "",
+    access: Literal["anyone", "admin", "superadmin"] = "admin",
+) -> None:
+    """Add a command to the admins' command lists."""
+    COMMAND_USAGES[name] = usage
+    if access == "admin":
+        ADMIN_COMMANDS.append(BotCommand(name, description))
+    if access in ("admin", "superadmin"):
+        SUPERADMIN_COMMANDS.append(BotCommand(name, description))
 
 
 def command(
@@ -89,17 +103,14 @@ def command(
 ) -> Callable[[CommandCallback], CommandHandlerCallback]:
     """
     Wrap a command implementation into a handler that checks access and argument count,
-    replies with `CommandError` messages and logs other errors.
+    replies with `CommandError` messages and logs other errors. Running a command in
+    DMs clears any pending evaluation command or /search.
     """
 
-    COMMAND_USAGES[name] = usage
-    if access == "admin":
-        ADMIN_COMMANDS.append(BotCommand(name, description))
-    if access in ("admin", "superadmin"):
-        SUPERADMIN_COMMANDS.append(BotCommand(name, description))
+    list_command(name, description, usage, access)
 
     def decorator(func: CommandCallback) -> CommandHandlerCallback:
-        async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        async def handler(update: Update, context: Context) -> None:
             try:
                 msg = cast(Message, update.message)
                 sender = cast(User, msg.from_user)
@@ -107,6 +118,8 @@ def command(
                     return
                 if access == "superadmin" and sender.id != cfg.admins[0]:
                     return
+                if msg.chat.type == "private":
+                    clear_pending(context.user_data)
                 args = context.args or []
                 if len(args) < min_args or (max_args is not None and len(args) > max_args):
                     await msg.reply_text(f"Usage: /{name} {usage}")
@@ -449,6 +462,13 @@ async def handle_chats(msg: Message, sender: User, args: list[str], bot: Bot) ->
     await msg.reply_text(text, reply_markup=keyboard)
 
 
+# Evaluation commands and /search are parsed from admin DMs by main.py, not by command handlers.
+list_command("evalpurpose", "Evaluate the next message with a custom chat purpose", "<purpose>")
+list_command("reeval", "Evaluate the next message ignoring cached verdicts")
+list_command("debug", "Show the LLM prompt for the next message instead of evaluating")
+list_command("search", "Look up the latest check of a message", "<message>")
+
+
 @command("help", "List available commands")
 async def handle_help(msg: Message, sender: User, args: list[str], bot: Bot) -> None:
     lines = ["Available commands:"]
@@ -468,7 +488,7 @@ async def handle_hello(msg: Message, sender: User, args: list[str], bot: Bot) ->
     await msg.set_reaction("👍")
 
 
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback_query(update: Update, context: Context):
     try:
         qry = cast(CallbackQuery, update.callback_query)
         data = qry.data or ""
