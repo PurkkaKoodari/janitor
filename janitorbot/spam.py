@@ -167,6 +167,12 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     else:
         purpose = chat_purpose(msg.chat.id)
 
+    # Allow admins to bypass the verdict cache when evaluating.
+    reevaluate = is_evaluation and text.startswith("reeval:\n")
+    if reevaluate:
+        text = text[len("reeval:\n") :]
+        logger.info("Reevaluation requested, bypassing verdict cache.")
+
     system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
 
     llm_user_message = await prepare_llm_input(text, media_info)
@@ -194,7 +200,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     # Reuse the verdict of an identical earlier message checked with the same system prompt.
     sp_hash = system_prompt_hash(system_prompt)
     c_hash = content_hash(llm_user_message)
-    cached_probs = cached_verdict(sp_hash, c_hash)
+    cached_probs = [] if reevaluate else cached_verdict(sp_hash, c_hash)
 
     # Now run the LLM check and react to the result.
     try:

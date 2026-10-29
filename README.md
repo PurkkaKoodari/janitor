@@ -145,6 +145,17 @@ purpose: people sell and give away used furniture in Helsinki
 Selling my old sofa, 20€, pick up in Kallio
 ```
 
+### `reeval:`
+
+Identical messages reuse earlier verdicts instead of asking the AI again. To force a fresh check of a simulated message, put `reeval:` on the first line:
+
+```
+reeval:
+Selling my old sofa, 20€, pick up in Kallio
+```
+
+You can combine this with `purpose:` by putting the `purpose:` line first.
+
 ### `debug:`
 
 To see exactly what the AI receives without running a check, put `debug:` on the first line:
