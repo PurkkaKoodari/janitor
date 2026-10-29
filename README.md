@@ -134,7 +134,7 @@ The bot replies with the most recent check of a message with the same text. A `s
 
 ### Simulating a message
 
-Any other message you send to the bot privately is checked as if it had been posted in a group, but nothing is deleted. If the bot thinks it's spam, it sends you the verdict and reasoning. If it doesn't, it stays silent. To see the reasoning in that case, send the same text again with `search:` above it.
+Any other message you send to the bot privately is checked as if it had been posted in a group, but nothing is deleted. The bot replies with the verdict and reasoning, even with `quiet = true`.
 
 Messages shorter than `llm.min_length` aren't sent to the AI at all.
 

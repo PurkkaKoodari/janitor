@@ -115,6 +115,8 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     """
     chat_id = msg.chat.id
     sender = cast(User, msg.from_user)
+    from_admin = sender.id in effective_admins()
+    is_evaluation = msg.chat.id in effective_admins()
     text, _, media_info = parse_message(msg)
 
     # Check for forwarded special cases of spam, and react to them.
@@ -159,7 +161,7 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
 
     # For other messages, run the LLM check and then process them in the after function.
     # Allow admins to override the purpose.
-    if sender.id in effective_admins() and text.startswith("purpose: ") and "\n" in text:
+    if from_admin and text.startswith("purpose: ") and "\n" in text:
         purpose, _, text = text[len("purpose: ") :].partition("\n")
         logger.info("Using custom purpose from admin: %s", purpose)
     else:
@@ -173,9 +175,14 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
     if llm_user_message is None:
         logger.info("Short message, skipping LLM check!")
         record_checked_message(msg, False, reasoning="Short message, skipped LLM check")
+        if is_evaluation:
+            await msg.reply_text(
+                f"The message is short enough (< {cfg.llm.min_length} characters) to be assumed not spam.",
+                do_quote=True,
+            )
         return True
 
-    if sender.id in effective_admins() and text.startswith("debug:\n"):
+    if from_admin and text.startswith("debug:\n"):
         logger.info("Debug mode, sending system prompt to admin.")
         await bot.send_message(
             chat_id=sender.id,
@@ -203,13 +210,15 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
         else:
 
             async def report_error(error: LLMError) -> None:
-                # Record the error in the database.
+                # Record fatal errors in the database.
                 if error.fatal:
                     record_checked_message(msg, False, c_hash=c_hash, reasoning=str(error))
                 # Report to the super admin if configured.
-                if cfg.quiet:
-                    return
-                if error.fatal or (cfg.llm.report_provider_issues and error.is_provider_issue):
+                reported_to = None
+                if not cfg.quiet and (
+                    error.fatal or (cfg.llm.report_provider_issues and error.is_provider_issue)
+                ):
+                    reported_to = cfg.admins[0]
                     await bot.send_message(
                         chat_id=cfg.admins[0],
                         reply_parameters=ReplyParameters(
@@ -217,6 +226,9 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                         ),
                         text=str(error)[:4095],
                     )
+                # Always report fatal errors in evaluations to the evaluating admin.
+                if error.fatal and is_evaluation and sender.id != reported_to:
+                    await msg.reply_text(str(error)[:4095], do_quote=True)
 
             logger.info("LLM checking message...")
             prob, reasoning, samples = await llm_check(
@@ -237,11 +249,13 @@ async def check_spam(bot: Bot, msg: Message) -> bool:
                 prob=prob,
                 sample_probs=sample_probs,
             )
-        elif cfg.debug:
-            # Not spam, but still send the reasoning to the admins for debugging.
+        elif is_evaluation or cfg.debug:
+            # Not spam, but still send the reasoning to the admin(s) for debugging/evaluation.
+            # Reply to the sender if in DMs, otherwise send to the super admin.
+            target = sender.id if is_evaluation else cfg.admins[0]
             sampled = sampled_prob_range(sample_probs)
             await bot.send_message(
-                chat_id=cfg.admins[0],
+                chat_id=target,
                 reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
                 text=f"Spam probability: {prob:.2f}{sampled}\nReasoning: {reasoning}"[:4095],
             )
@@ -316,33 +330,38 @@ async def attempt_delete_ban(
 
     sender = cast(User, msg.from_user)
     caller = msg.guest_bot_caller_user
-    monitor = sender.id if sender.id in effective_admins() else cfg.chats.monitor
+    from_admin = (
+        sender.id
+        if sender.id in effective_admins()
+        else caller.id if (caller and caller.id in effective_admins()) else None
+    )
+    monitor = from_admin or cfg.chats.monitor
 
-    fwd_msg = None
-    if monitor:
+    reply_to = None
+    if monitor == msg.chat.id:
+        # Evaluations are replied to directly, no need to forward the message to the admin.
+        reply_to = msg.message_id
+    elif monitor:
         try:
             fwd_msg = await msg.forward(chat_id=monitor)
+            reply_to = fwd_msg.message_id
         except TelegramError:
             logger.warning("Failed to forward message to monitor chat", exc_info=True)
 
     no_delete = ""
     no_ban = ""
-    simulation = (
-        sender.id in effective_admins()
-        or (caller and caller.id in effective_admins())
-        or msg.chat.id not in effective_moderated_chats()
-    )
+    simulation = from_admin or msg.chat.id not in effective_moderated_chats()
     if simulation:
-        no_ban = "\n(simulation, would have been deleted/banned)"
+        no_ban = "(simulation, would have been deleted/banned)"
     else:
         mode = chat_mode(msg.chat.id)
         if mode == "test":
-            no_ban = "\n(test mode, no action taken)"
+            no_ban = "(test mode, no action taken)"
         else:
             try:
                 await msg.delete()
             except TelegramError as ex:
-                no_delete = f"\nFailed to delete: {ex}"
+                no_delete = f"Failed to delete: {ex}"
             # The message may have been mirrored before being edited into spam.
             await delete_mirrors(bot, msg.chat.id, [msg.message_id])
             if caller and sender.username:
@@ -354,19 +373,19 @@ async def attempt_delete_ban(
                     "message(s) of caller mentioning the bot",
                 )
             if mode != "ban":
-                no_ban = "\n(banning disabled for this chat)"
+                no_ban = "(banning disabled for this chat)"
             elif (
                 is_established_user(sender.id)
                 and recent_spam_count(sender.id) < cfg.established_user.ban_threshold_messages
             ):
                 # TODO: Once python-telegram-bot supports ephemeral messages
                 # (bot API 10.3), send one to warn the user and contact cfg.admin_name.
-                no_ban = "\n(established user, not banned)"
+                no_ban = "(established user, not banned)"
             else:
                 try:
                     await ban_user(bot, msg, sender)
                 except TelegramError as ex:
-                    no_ban = f"\nFailed to ban: {ex}"
+                    no_ban = f"Failed to ban: {ex}"
 
     caller_ban_text = None
     if caller:
@@ -390,21 +409,26 @@ async def attempt_delete_ban(
             or str(msg.chat.id)
         )
         sampled = sampled_prob_range(sample_probs)
-        text = (
-            f"Posted by {user_name} in {chat_name}"
-            + (f"\nSpam probability: {prob:.2f}{sampled}" if prob is not None else "")
-            + f"{no_delete}{no_ban}"
-            + (f"\nReasoning: {reasoning}" if reasoning else "")
-        )
+        parts: list[str] = []
+        if monitor != msg.chat.id:
+            parts.append(f"Posted by {user_name} in {chat_name}")
+        if prob is not None:
+            parts.append(f"Spam probability: {prob:.2f}{sampled}")
+        if no_delete:
+            parts.append(no_delete)
+        if no_ban:
+            parts.append(no_ban)
+        if reasoning:
+            parts.append(f"Reasoning: {reasoning}")
         await bot.send_message(
             chat_id=monitor,
-            reply_to_message_id=fwd_msg.message_id if fwd_msg else None,
-            text=text[:4095],
+            reply_to_message_id=reply_to,
+            text="\n".join(parts)[:4095],
         )
 
     if monitor and caller_ban_text:
         await bot.send_message(
             chat_id=monitor,
-            reply_to_message_id=fwd_msg.message_id if fwd_msg else None,
+            reply_to_message_id=reply_to,
             text=caller_ban_text,
         )
