@@ -34,7 +34,7 @@ from janitorbot.db import (
     chat_purpose,
     content_hash,
     effective_admins,
-    effective_moderated_chats,
+    effective_spam_checked_chats,
     is_established_user,
     is_new_user,
     mentioning_message_ids,
@@ -121,7 +121,7 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
     # If the message is likely spam, don't process it further.
     if (
         cfg.spam.forwarded_story
-        and msg.chat.id in effective_moderated_chats()
+        and msg.chat.id in effective_spam_checked_chats()
         and msg.story
         and msg.story.chat.id != sender.id
     ):
@@ -129,7 +129,7 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
         return False
 
     fwd_from_channel = msg.forward_origin and msg.forward_origin.type == "channel"
-    if msg.chat.id in effective_moderated_chats() and fwd_from_channel:
+    if msg.chat.id in effective_spam_checked_chats() and fwd_from_channel:
         if cfg.spam.channel_forwarded_with_keyboard and msg.reply_markup:
             await attempt_delete_ban(
                 bot, msg, parsed, reasoning="Forwarded message from channel with inline keyboard"
@@ -151,7 +151,8 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
 
     # Also check for spam regexes. These can save cost and time by avoiding LLM checks for obvious spam.
     if (
-        chat_id in effective_moderated_chats()
+        not parsed.debug
+        and chat_id in effective_spam_checked_chats()
         and parsed.text
         and re.search(cfg.spam_pattern, parsed.text, re.I)
     ):
@@ -239,7 +240,7 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
 
             logger.info("LLM checking message...")
             prob, reasoning, samples = await llm_check(
-                llm_user_message, purpose, report_error=report_error
+                llm_user_message, system_prompt, report_error=report_error
             )
             sample_probs = [sample[0] for sample in samples]
 
@@ -359,7 +360,7 @@ async def attempt_delete_ban(
 
     no_delete = ""
     no_ban = ""
-    simulation = from_admin or msg.chat.id not in effective_moderated_chats()
+    simulation = from_admin or msg.chat.id not in effective_spam_checked_chats()
     if simulation:
         no_ban = "(simulation, would have been deleted/banned)"
     else:

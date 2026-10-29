@@ -135,7 +135,7 @@ The bot replies with the most recent check of a message with the same text. A `/
 
 Any other message you send to the bot privately is checked as if it had been posted in a group, but nothing is deleted. The bot replies with the verdict and reasoning, even with `quiet = true`.
 
-Messages shorter than `llm.min_length` aren't sent to the AI at all.
+Messages shorter than `llm.min_length` aren't sent to the AI at all, and messages matching `spam.*` rules are flagged as spam without asking the AI.
 
 The following commands change how the next message you send is simulated. You can combine them, except `/reeval` with `/debug`, and the bot confirms which ones are in effect.
 

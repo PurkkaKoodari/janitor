@@ -88,17 +88,14 @@ async def _resolve_provider(e: Exception, response: ChatResult | None) -> str | 
         return None
 
 
-async def llm_api(user_message: str, purpose: str) -> ChatResult:
+async def llm_api(user_message: str, system_prompt: str) -> ChatResult:
     """
-    Call the LLM API with the given user message and purpose, and return the response.
+    Call the LLM API with the given user message and system prompt, and return the response.
     """
     return await or_client.chat.send_async(
         model=cfg.llm.model,
         messages=[
-            {
-                "role": "system",
-                "content": cfg.llm.system_prompt.format(purpose=purpose),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
         max_tokens=3000,
@@ -308,7 +305,7 @@ def _handle_llm_error_async(
 
 async def llm_check(
     user_message: str,
-    purpose: str,
+    system_prompt: str,
     *,
     retry: int = cfg.llm.retry_count,
     recursive: bool = False,
@@ -323,7 +320,7 @@ async def llm_check(
     Returns a tuple of (spam_probability, reasoning, samples).
     """
     # Wrap the call in a task so we can await it multiple times.
-    task = asyncio.create_task(llm_api(user_message, purpose))
+    task = asyncio.create_task(llm_api(user_message, system_prompt))
     try:
         response = await asyncio.wait_for(asyncio.shield(task), timeout=cfg.llm.timeout)
         prob, reasoning, usage = _parse_llm_response(response)
@@ -342,7 +339,7 @@ async def llm_check(
             await asyncio.sleep(cfg.llm.retry_delay)
             return await llm_check(
                 user_message,
-                purpose,
+                system_prompt,
                 retry=retry - 1,
                 recursive=recursive,
                 report_error=report_error,
@@ -366,7 +363,7 @@ async def llm_check(
         )
         further = await asyncio.gather(
             *(
-                llm_check(user_message, purpose, recursive=True, report_error=report_error)
+                llm_check(user_message, system_prompt, recursive=True, report_error=report_error)
                 for _ in range(cfg.llm.multisample_count - 1)
             ),
             return_exceptions=True,
