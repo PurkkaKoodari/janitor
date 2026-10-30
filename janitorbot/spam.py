@@ -17,7 +17,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import re
+import random, re
 from dataclasses import dataclass
 from typing import cast
 
@@ -363,18 +363,24 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
         # Run an A/B test in the background if configured. Report to the evaluating admin if
         # this is an evaluation, otherwise to the super admin.
         if a_b_llm_cfg := cfg.llm.a_b_test_config():
-            spawn_task(
-                run_a_b_test(
-                    bot,
-                    msg,
-                    prepare_llm_input(prepared, purpose, a_b_llm_cfg),
-                    a_b_llm_cfg,
-                    a_verdict=verdict,
-                    reevaluate=parsed.reevaluate,
-                    target=sender.id if is_evaluation else cfg.admins[0],
-                ),
-                "A/B test",
+            sample_rate = (
+                cfg.llm.a_b_test.spam_sample_rate
+                if verdict.spam
+                else cfg.llm.a_b_test.nonspam_sample_rate
             )
+            if is_evaluation or random.random() < sample_rate:
+                spawn_task(
+                    run_a_b_test(
+                        bot,
+                        msg,
+                        prepare_llm_input(prepared, purpose, a_b_llm_cfg),
+                        a_b_llm_cfg,
+                        a_verdict=verdict,
+                        reevaluate=parsed.reevaluate,
+                        target=sender.id if is_evaluation else cfg.admins[0],
+                    ),
+                    "A/B test",
+                )
 
         return not verdict.spam
     except DeferredLLMError:

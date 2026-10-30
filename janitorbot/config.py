@@ -25,6 +25,7 @@ from openrouter.components import Effort
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     PlainValidator,
     computed_field,
     field_validator,
@@ -89,6 +90,8 @@ SameAsA = Annotated[Literal[False], PlainValidator(_require_false)]
 
 
 class ABTestConfig(StrictModel):
+    spam_sample_rate: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+    nonspam_sample_rate: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
     model: SameAsA | str = False
     temperature: SameAsA | float = False
     reasoning_effort: SameAsA | Effort = False
@@ -137,7 +140,9 @@ class LLMConfig(StrictModel):
         """
         overrides = {
             key: value
-            for key, value in self.a_b_test.model_dump().items()
+            for key, value in self.a_b_test.model_dump(
+                exclude={"spam_sample_rate", "nonspam_sample_rate"}
+            ).items()
             if value is not False and value != getattr(self, key)
         }
         if not overrides:

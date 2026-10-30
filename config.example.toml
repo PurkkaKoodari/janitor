@@ -185,6 +185,11 @@ threshold = false
 multisample_threshold = false
 multisample_count = false
 
+# Optionally only A/B test a fraction of messages, based on the main model verdict.
+# Admin evaluations are always A/B tested.
+spam_sample_rate = 1.0
+nonspam_sample_rate = 1.0
+
 # Map chat IDs (as strings) to a description of each chat's purpose.
 # The default key is used as the fallback.
 # This is no longer recommended for use; use the /purpose command instead.
