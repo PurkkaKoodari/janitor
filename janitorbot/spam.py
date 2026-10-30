@@ -44,7 +44,12 @@ from janitorbot.db import (
 )
 from janitorbot.llm import DeferredLLMError, LLMError, Verdict, llm_check
 from janitorbot.log import logger, message_logging
-from janitorbot.messages import ParsedMessage, extract_mentions, llm_user_message
+from janitorbot.messages import (
+    CYRILLIC_WORD_REGEX,
+    ParsedMessage,
+    extract_mentions,
+    llm_user_message,
+)
 from janitorbot.util import spawn_task
 
 
@@ -215,7 +220,7 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
             cfg.spam.channel_forwarded_cyrillic_and_links
             and parsed.text
             and re.search(cfg.spam.suspicious_link_regex, parsed.text)
-            and re.search(r"[\u0400-\u052F]", parsed.text, re.I)
+            and re.search(CYRILLIC_WORD_REGEX, parsed.text, re.I)
         ):
             await attempt_delete_ban(
                 bot,

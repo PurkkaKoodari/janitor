@@ -274,6 +274,8 @@ async def fetch_tme_description(url: str) -> str:
 
 # CJK spam is often very short, so always check messages containing CJK characters.
 CJK_REGEX = re.compile(r"[\u4E00-\u9FFF]")
+# Messages containing Cyrillic are often spam.
+CYRILLIC_WORD_REGEX = re.compile(r"[\u0400-\u052F]{3,}")
 TME_LINK_REGEX = re.compile(r"https?://t\.me/[^\s)\]]+")
 
 
