@@ -172,6 +172,19 @@ outlier_threshold = 0.2
 # the message content. Verdicts are kept for caching.
 reasoning_retention_days = 90
 
+[llm.a_b_test]
+# If any of these are set, the bot will run all LLM-checked messages through both sets of
+# configurations, and report cases where the final verdicts differ.
+# Each setting works just like the corresponding one in the [llm] section.
+# Any values left at false are copied from the [llm] section.
+model = false
+temperature = false
+reasoning_effort = false
+system_prompt = false
+threshold = false
+multisample_threshold = false
+multisample_count = false
+
 # Map chat IDs (as strings) to a description of each chat's purpose.
 # The default key is used as the fallback.
 # This is no longer recommended for use; use the /purpose command instead.

@@ -26,36 +26,34 @@ from janitorbot.commands import fetch_chat_name
 from janitorbot.config import cfg
 from janitorbot.db import (
     RecordedCheck,
-    content_hash,
     find_checks,
     find_mirrored_checks,
     latest_uncached_check,
     text_hash,
 )
-from janitorbot.messages import ParsedMessage, prepare_llm_input
+from janitorbot.messages import ParsedMessage
+from janitorbot.spam import prepare_llm_content
 
 
-async def _llm_content_hash(parsed: ParsedMessage) -> bytes:
-    """Return the content hash the message would be cached under."""
-    llm_user_message = cast(str, await prepare_llm_input(parsed, force=True))
-    return content_hash(llm_user_message)
-
-
-async def describe_check(bot: Bot, check: RecordedCheck) -> list[str]:
+async def describe_check(bot: Bot, check: RecordedCheck, nested: bool = False) -> list[str]:
     """Describe a recorded check: a header and each LLM sample with its reasoning."""
     chat = await fetch_chat_name(bot, check.chat_id)
     date = datetime.fromtimestamp(check.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-    verdict = "spam" if check.spam else "not spam"
-    parts = [f"Message {check.message_id} in {chat} sent at {date}: {verdict}"]
+    parts = [f"Message {check.message_id} in {chat} sent at {date}"]
+    if not nested:
+        parts[0] += ": " + (
+            "unknown" if not check.primary else "spam" if check.spam else "not spam"
+        )
 
     if check.cached:
         original = latest_uncached_check(
             c_hash=cast(bytes, check.content_hash),
             sp_hash=check.system_prompt_hash,
-            before=check.rowid,
+            before=check.check_id,
+            primary_only=False,
         )
         if original and not original.cached:  # Should never be cached, but sanity check
-            header, *reasoning = await describe_check(bot, original)
+            header, *reasoning = await describe_check(bot, original, nested=True)
             parts[0] += "\nCached reasoning used:\n" + header
             parts.extend(reasoning)
         else:
@@ -119,7 +117,7 @@ async def search_forwarded(bot: Bot, msg: Message, parsed: ParsedMessage) -> boo
     """
     origin = msg.forward_origin
     assert origin is not None
-    c_hash = await _llm_content_hash(parsed)
+    c_hash = (await prepare_llm_content(parsed)).c_hash
 
     if (
         isinstance(origin, MessageOriginChannel)
@@ -133,9 +131,14 @@ async def search_forwarded(bot: Bot, msg: Message, parsed: ParsedMessage) -> boo
         timestamp = int(origin.date.timestamp())
         # Search with user + timestamp + content, or just the timestamp + content if user is hidden.
         checks = find_checks(user_id, timestamp, c_hash)
+        if not checks and parsed.text:
+            # No match with content hash, but there is text. Perhaps a link description changed.
+            # Retry with (user +) timestamp + text-only hash.
+            t_hash = text_hash(parsed.text)
+            checks = find_checks(user_id, timestamp, t_hash, text_only=True)
         if not checks and user_id is not None:
-            # User is visible, but no match with content hash. May be an edit we haven't seen,
-            # or perhaps a link description changed. Retry with just user + timestamp.
+            # User is visible, but still no content match. May be an edit we haven't seen.
+            # Retry with just user + timestamp.
             checks = find_checks(user_id, timestamp, None)
             if checks:
                 await msg.reply_text(
@@ -164,11 +167,12 @@ async def search_text(bot: Bot, msg: Message, parsed: ParsedMessage) -> None:
     the same text if the attachments differ, or failing that, the latest non-LLM verdict of the
     same text.
     """
-    c_hash = await _llm_content_hash(parsed)
+    c_hash = (await prepare_llm_content(parsed)).c_hash
     check = latest_uncached_check(c_hash=c_hash)
     if check is None and parsed.text.strip():
+        # No match with the same attachments, but perhaps the query is missing some or
+        # a link description changed.
         t_hash = text_hash(parsed.text)
-        # No match with the same attachments, but perhaps the query is missing some.
         check = latest_uncached_check(c_hash=t_hash, text_only=True)
         if check is None:
             # No LLM verdict, but the message may have been handled without the LLM.

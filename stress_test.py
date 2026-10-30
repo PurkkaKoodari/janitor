@@ -92,30 +92,35 @@ async def main() -> None:
             continue
 
         try:
-            prob, reasoning, _ = await llm_check(
-                text, cfg.llm.system_prompt.format(purpose=purpose)
-            )
+            verdict = await llm_check(text, cfg.llm.system_prompt.format(purpose=purpose))
         except Exception as e:
             print(f"\nError on msg {msg_id}: {e}", file=sys.stderr)
             continue
 
         checked += 1
-        is_spam = prob >= cfg.llm.threshold
         writer.writerow(
-            [f"{prob:.4f}", "1" if is_spam else "0", msg_id, date, sender, text, reasoning]
+            [
+                f"{verdict.prob:.4f}",
+                "1" if verdict.spam else "0",
+                msg_id,
+                date,
+                sender,
+                text,
+                verdict.reasoning,
+            ]
         )
         sys.stdout.flush()
 
         print(
-            f"\r\x1b[K[{i+1}/{total}] checked={checked} skipped={skipped} prob={prob:.2f} {'SPAM' if is_spam else ''}",
+            f"\r\x1b[K[{i+1}/{total}] checked={checked} skipped={skipped} prob={verdict.prob:.2f} {'SPAM' if verdict.spam else ''}",
             end="",
             file=sys.stderr,
             flush=True,
         )
 
-        if is_spam:
+        if verdict.spam:
             total_spam += 1
-            pending_spam.append({"prob": prob, "sender": sender, "text": text})
+            pending_spam.append({"prob": verdict.prob, "sender": sender, "text": text})
             if len(pending_spam) >= 3:
                 if not ask_continue(pending_spam):
                     print("\nAborted by user.", file=sys.stderr)

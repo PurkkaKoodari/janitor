@@ -56,6 +56,7 @@ from janitorbot.db import (
     effective_moderated_chats,
     effective_spam_checked_chats,
     purge_old_reasonings,
+    record_join,
 )
 from janitorbot.log import logger, message_logging
 from janitorbot.messages import OverrideError, ParsedMessage, parse_message
@@ -66,7 +67,7 @@ from janitorbot.state import (
     set_pending,
 )
 from janitorbot.search import search_forwarded, search_text
-from janitorbot.spam import check_spam, record_joins
+from janitorbot.spam import check_spam
 
 
 async def process_admin_commands(context: Context, msg: Message) -> ParsedMessage | None:
@@ -165,7 +166,12 @@ async def process_message(context: Context, msg: Message):
     # but don't process them further.
     if msg.new_chat_members or msg.left_chat_member:
         if msg.new_chat_members:
-            record_joins(msg)
+            record_join(
+                msg.chat.id,
+                msg.message_id,
+                int(msg.date.timestamp()),
+                [member.id for member in msg.new_chat_members],
+            )
         if msg.chat.id in effective_moderated_chats() and chat_deletes_join_leave(msg.chat.id):
             try:
                 await msg.delete()

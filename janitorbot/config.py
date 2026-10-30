@@ -19,18 +19,24 @@
 
 import re, tomllib
 from functools import cached_property
-from typing import Literal
+from typing import Annotated, Literal
 
 from openrouter.components import Effort
-from pydantic import BaseModel, ConfigDict, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    PlainValidator,
+    computed_field,
+    field_validator,
+)
 
 from janitorbot.log import logger
 
 
 class StrictModel(BaseModel):
-    """Base for config models that rejects unknown keys."""
+    """Base for config models that rejects unknown keys and type coercion."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class Rule(StrictModel):
@@ -71,11 +77,32 @@ class NewUserConfig(StrictModel):
     max_nonspam_messages: int = 2
 
 
+def _require_false(v: object) -> Literal[False]:
+    """Accept only the literal False, unlike Literal[False] which accepts 0 even in strict mode."""
+    if v is not False:
+        raise ValueError("must be false")
+    return v
+
+
+# False in the A/B test config, meaning "same as A".
+SameAsA = Annotated[Literal[False], PlainValidator(_require_false)]
+
+
+class ABTestConfig(StrictModel):
+    model: SameAsA | str = False
+    temperature: SameAsA | float = False
+    reasoning_effort: SameAsA | Effort = False
+    system_prompt: SameAsA | str = False
+    threshold: SameAsA | float = False
+    multisample_threshold: SameAsA | float = False
+    multisample_count: SameAsA | int = False
+
+
 class LLMConfig(StrictModel):
     openrouter_key: str
     model: str
     temperature: float = 0.5
-    reasoning_effort: Effort | None = "medium"
+    reasoning_effort: Effort = "medium"
     timeout: float = 15.0
     retry_delay: float = 1.0
     retry_count: int = 2
@@ -89,6 +116,7 @@ class LLMConfig(StrictModel):
     outlier_threshold: float = 0.2
     chat_purposes: dict[str, str]
     reasoning_retention_days: int = 90
+    a_b_test: ABTestConfig = ABTestConfig()
 
     @field_validator("openrouter_key")
     @classmethod
@@ -101,6 +129,20 @@ class LLMConfig(StrictModel):
     def purposes_has_default(cls, v: dict[str, str]) -> dict[str, str]:
         assert "default" in v, "llm.chat_purposes must have a 'default' key"
         return v
+
+    def a_b_test_config(self) -> "LLMConfig | None":
+        """
+        Return this config with the A/B test overrides applied, or None if no override differs
+        from this config (i.e. A/B testing is disabled).
+        """
+        overrides = {
+            key: value
+            for key, value in self.a_b_test.model_dump().items()
+            if value is not False and value != getattr(self, key)
+        }
+        if not overrides:
+            return None
+        return self.model_copy(update=overrides | {"a_b_test": ABTestConfig()})
 
 
 class ChannelForwardingConfig(StrictModel):

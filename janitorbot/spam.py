@@ -18,17 +18,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import re
-from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import cast
 
 from telegram import Bot, Message, ReplyParameters, User
 from telegram.error import TelegramError
 
 from janitorbot.channel import bulk_delete, delete_mirrors
-from janitorbot.config import cfg
+from janitorbot.config import LLMConfig, cfg
 from janitorbot.db import (
-    CACHED_REASONING,
-    MessageRecord,
     cached_verdict,
     chat_mode,
     chat_purpose,
@@ -39,72 +37,150 @@ from janitorbot.db import (
     is_new_user,
     mentioning_message_ids,
     recent_spam_count,
-    record_message,
+    record_message_check,
     system_prompt_hash,
     text_hash,
     user_message_ids,
 )
-from janitorbot.llm import DeferredLLMError, LLMError, llm_check
-from janitorbot.log import logger
-from janitorbot.messages import ParsedMessage, extract_mentions, prepare_llm_input
+from janitorbot.llm import DeferredLLMError, LLMError, Verdict, llm_check
+from janitorbot.log import logger, message_logging
+from janitorbot.messages import ParsedMessage, extract_mentions, llm_user_message
+from janitorbot.util import spawn_task
+
+
+@dataclass
+class LLMContent:
+    """A message prepared for LLM checking, with the user message and its content hash."""
+
+    text: str
+    user_message: str
+    c_hash: bytes
+    llm_viable: bool
+
+
+async def prepare_llm_content(parsed: ParsedMessage) -> LLMContent:
+    """Prepare the message for LLM checking."""
+    user_message, llm_viable = await llm_user_message(parsed)
+    return LLMContent(
+        text=parsed.text,
+        user_message=user_message,
+        c_hash=content_hash(user_message),
+        llm_viable=llm_viable,
+    )
+
+
+@dataclass
+class LLMInput(LLMContent):
+    """A message prepared for LLM checking, with the user/system prompts and hashes."""
+
+    system_prompt: str
+    sp_hash: bytes
+
+
+def prepare_llm_input(prepared: LLMContent, purpose: str, llm_cfg: LLMConfig) -> LLMInput:
+    """Prepare the message for LLM checking, with the system prompt and its hash."""
+    system_prompt = llm_cfg.system_prompt.format(purpose=purpose)
+    return LLMInput(
+        text=prepared.text,
+        user_message=prepared.user_message,
+        c_hash=prepared.c_hash,
+        llm_viable=prepared.llm_viable,
+        system_prompt=system_prompt,
+        sp_hash=system_prompt_hash(system_prompt, llm_cfg),
+    )
 
 
 def record_checked_message(
     msg: Message,
-    parsed: ParsedMessage,
-    spam: bool,
+    prepared: ParsedMessage | LLMContent,
+    verdict: Verdict,
     *,
-    sp_hash: bytes | None = None,
-    c_hash: bytes | None = None,
-    samples: Sequence[tuple[float, str | None]] | None = None,
-    reasoning: str | None = None,
+    primary: bool = True,
 ) -> None:
     """
     Store the result of spam checking the message in the database, with either the LLM samples or
-    the non-LLM reasoning.
+    the non-LLM reasoning. Non-primary checks don't affect the message's verdict.
     """
-    t_hash = text_hash(parsed.text)
-    record_message(
-        MessageRecord(
-            chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            user_id=cast(User, msg.from_user).id,
-            timestamp=int(msg.date.timestamp()),
-            system=False,
-            spam=spam,
-            mentions=extract_mentions(msg),
-            system_prompt_hash=sp_hash,
-            content_hash=c_hash,
-            text_hash=t_hash,
-            llm_samples=samples,
-            reasoning=reasoning,
-        )
+    record_message_check(
+        chat_id=msg.chat.id,
+        message_id=msg.message_id,
+        user_id=cast(User, msg.from_user).id,
+        timestamp=int(msg.date.timestamp()),
+        mentions=extract_mentions(msg),
+        verdict=verdict,
+        t_hash=text_hash(prepared.text),
+        sp_hash=prepared.sp_hash if isinstance(prepared, LLMInput) else None,
+        c_hash=prepared.c_hash if isinstance(prepared, LLMContent) else None,
+        primary=primary,
     )
 
 
-def record_joins(msg: Message) -> None:
-    """Store a join message in the database as a system message from each joined user."""
-    for member in msg.new_chat_members:
-        record_message(
-            MessageRecord(
-                chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                user_id=member.id,
-                timestamp=int(msg.date.timestamp()),
-                system=True,
-                spam=False,
-                mentions=[],
+async def run_a_b_test(
+    bot: Bot,
+    msg: Message,
+    prepared: LLMInput,
+    b_cfg: LLMConfig,
+    a_verdict: Verdict,
+    reevaluate: bool,
+    target: int,
+) -> None:
+    """
+    Check the message with the B side LLM config, reusing cached verdicts like the A side, and
+    report to the target if the verdict differs from the A side verdict.
+    """
+
+    async def report_error(error: LLMError) -> None:
+        # Report to the super admin if configured.
+        if error.should_report and not cfg.quiet:
+            await bot.send_message(
+                **msg.build_reply_arguments(
+                    target_chat_id=cfg.admins[0], allow_sending_without_reply=True
+                ),
+                text=f"A/B test: {error}"[:4095],
             )
-        )
 
+    b_verdict = (
+        None if reevaluate else cached_verdict(prepared.sp_hash, prepared.c_hash, b_cfg.threshold)
+    )
 
-def sampled_prob_range(samples: list[float]) -> str:
-    """
-    Formats the range of spam probabilities in the samples if there are multiple samples.
-    """
-    if len(samples) < 2:
-        return ""
-    return f" ({min(samples):.2f}\u2026{max(samples):.2f})"
+    if a_verdict.cached and b_verdict:
+        # Both verdicts come from earlier checks, so this is likely a repeat of an earlier report.
+        logger.info("Both verdicts of A/B test verdict cached, not reporting")
+        return
+    elif b_verdict:
+        logger.info("Using cached A/B test verdict, spam probability: %.2f", b_verdict.prob)
+    else:
+        try:
+            logger.info("LLM checking message with A/B test config...")
+            with message_logging(msg.chat.id, msg.message_id, extra="a_b_test"):
+                b_verdict = await llm_check(
+                    prepared.user_message,
+                    prepared.system_prompt,
+                    llm_cfg=b_cfg,
+                    report_error=report_error,
+                )
+        except DeferredLLMError:
+            # Will be reported asynchronously by report_error.
+            return
+        record_checked_message(msg, prepared, b_verdict, primary=False)
+
+    logger.info(
+        "A/B test: A spam probability %.2f (%s), B spam probability %.2f (%s)",
+        a_verdict.prob,
+        a_verdict.spam_str,
+        b_verdict.prob,
+        b_verdict.spam_str,
+    )
+    if b_verdict.spam == a_verdict.spam:
+        return
+
+    await bot.send_message(
+        **msg.build_reply_arguments(target_chat_id=target, allow_sending_without_reply=True),
+        text=f"A/B test verdicts differ:\n"
+        f"A: {a_verdict.spam_str}, probability {a_verdict.sample_range}\n"
+        f"B: {b_verdict.spam_str}, probability {b_verdict.sample_range}\n"
+        f"B reasoning: {b_verdict.reasoning}"[:4095],
+    )
 
 
 async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
@@ -172,26 +248,25 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
     else:
         purpose = chat_purpose(msg.chat.id)
 
-    if parsed.reevaluate:
-        logger.info("Reevaluation requested, bypassing verdict cache.")
-
-    system_prompt = cfg.llm.system_prompt.format(purpose=purpose)
-
-    llm_user_message = await prepare_llm_input(parsed)
+    prepared = prepare_llm_input(await prepare_llm_content(parsed), purpose, cfg.llm)
 
     if parsed.debug:
         logger.info("Debug mode, sending system prompt to admin.")
         await bot.send_message(
             chat_id=sender.id,
             reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-            text=f"System prompt:\n{system_prompt}\n\nMessage:\n{llm_user_message}"[:4095],
+            text=f"System prompt:\n{prepared.system_prompt}\n\nMessage:\n{prepared.user_message}"[
+                :4095
+            ],
         )
         return True
 
     # If the message has too little data to check, skip the LLM and assume it's not spam.
-    if llm_user_message is None:
+    if not prepared.llm_viable:
         logger.info("Short message, skipping LLM check!")
-        record_checked_message(msg, parsed, False, reasoning="Short message, skipped LLM check")
+        record_checked_message(
+            msg, prepared, Verdict(spam=False, reasoning="Short message, skipped LLM check")
+        )
         if is_evaluation:
             await msg.reply_text(
                 f"The message is short enough (< {cfg.llm.min_length} characters) to be assumed not spam.",
@@ -200,32 +275,29 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
         return True
 
     # Reuse the verdict of an identical earlier message checked with the same system prompt.
-    sp_hash = system_prompt_hash(system_prompt)
-    c_hash = content_hash(llm_user_message)
-    cached_probs = [] if parsed.reevaluate else cached_verdict(sp_hash, c_hash)
+    if parsed.reevaluate:
+        logger.info("Reevaluation requested, bypassing verdict cache.")
+        verdict = None
+    else:
+        verdict = cached_verdict(prepared.sp_hash, prepared.c_hash, cfg.llm.threshold)
 
     # Now run the LLM check and react to the result.
     try:
-        samples: Sequence[tuple[float, str]]
-        if cached_probs:
-            # Only record the reused median, not the reasoning or the individual samples.
-            prob = cached_probs[(len(cached_probs) - 1) // 2]
-            samples = [(prob, CACHED_REASONING)]
-            # Still show the range of the cached samples in the monitor chat.
-            sample_probs = cached_probs
-            reasoning = "Cached LLM verdict from previous message"
-            logger.info("Using cached verdict, spam probability: %.2f", prob)
+        if verdict:
+            logger.info("Using cached verdict, spam probability: %.2f", verdict.prob)
         else:
 
             async def report_error(error: LLMError) -> None:
                 # Record fatal errors in the database.
                 if error.fatal:
-                    record_checked_message(msg, parsed, False, c_hash=c_hash, reasoning=str(error))
+                    record_checked_message(
+                        msg,
+                        prepared,
+                        Verdict(spam=False, reasoning=str(error)),
+                    )
                 # Report to the super admin if configured.
                 reported_to = None
-                if not cfg.quiet and (
-                    error.fatal or (cfg.llm.report_provider_issues and error.is_provider_issue)
-                ):
+                if error.should_report and not cfg.quiet:
                     reported_to = cfg.admins[0]
                     await bot.send_message(
                         chat_id=cfg.admins[0],
@@ -239,55 +311,67 @@ async def check_spam(bot: Bot, msg: Message, parsed: ParsedMessage) -> bool:
                     await msg.reply_text(str(error)[:4095], do_quote=True)
 
             logger.info("LLM checking message...")
-            prob, reasoning, samples = await llm_check(
-                llm_user_message, system_prompt, report_error=report_error
+            verdict = await llm_check(
+                prepared.user_message, prepared.system_prompt, report_error=report_error
             )
-            sample_probs = [sample[0] for sample in samples]
 
         # Store the verdict.
-        spam = prob >= cfg.llm.threshold
-        record_checked_message(msg, parsed, spam, sp_hash=sp_hash, c_hash=c_hash, samples=samples)
+        record_checked_message(msg, prepared, verdict)
 
-        if spam:
+        if verdict.spam:
             # Likely spam, delete and ban, and send the reasoning to the monitor chat for review.
-            await attempt_delete_ban(
-                bot,
-                msg,
-                parsed,
-                reasoning=reasoning,
-                prob=prob,
-                sample_probs=sample_probs,
-            )
-        elif is_evaluation or cfg.debug:
-            # Not spam, but still send the reasoning to the admin(s) for debugging/evaluation.
-            # Reply to the sender if in DMs, otherwise send to the super admin.
-            target = sender.id if is_evaluation else cfg.admins[0]
-            sampled = sampled_prob_range(sample_probs)
-            await bot.send_message(
-                chat_id=target,
-                reply_parameters=ReplyParameters(chat_id=msg.chat.id, message_id=msg.message_id),
-                text=f"Spam probability: {prob:.2f}{sampled}\nReasoning: {reasoning}"[:4095],
-            )
+            await attempt_delete_ban(bot, msg, prepared, verdict)
+        else:
+            if is_evaluation or cfg.debug:
+                # Not spam, but still send the reasoning to the admin(s) for debugging/evaluation.
+                # Reply to the sender if in DMs, otherwise send to the super admin.
+                target = sender.id if is_evaluation else cfg.admins[0]
+                await bot.send_message(
+                    **msg.build_reply_arguments(
+                        target_chat_id=target, allow_sending_without_reply=True
+                    ),
+                    text=f"Spam probability: {verdict.sample_range}"
+                    f"\nReasoning: {verdict.reasoning}"[:4095],
+                )
 
         if (
             not cfg.quiet
             and cfg.llm.outlier_threshold < 1.0
-            and not cached_probs
-            and len(samples) >= 2
+            and not verdict.cached
+            and len(verdict.samples_to_store) >= 2
         ):
             # Attempt to detect outliers in the sampling in case there's room for improvement in the system prompt.
-            for sample_prob, sample_reasoning in (samples[0], samples[-1]):
-                if abs(sample_prob - prob) >= cfg.llm.outlier_threshold:
+            for sample_prob, sample_reasoning in (
+                verdict.samples_to_store[0],
+                verdict.samples_to_store[-1],
+            ):
+                if abs(sample_prob - verdict.prob) >= cfg.llm.outlier_threshold:
                     await bot.send_message(
                         chat_id=cfg.admins[0],
                         reply_parameters=ReplyParameters(
                             chat_id=msg.chat.id, message_id=msg.message_id
                         ),
-                        text=f"Outlier in sampling: {sample_prob:.2f} vs median {prob:.2f}\n"
+                        text=f"Outlier in sampling: {sample_prob:.2f} vs median {verdict.prob:.2f}\n"
                         f"Reasoning: {sample_reasoning}"[:4095],
                     )
 
-        return not spam
+        # Run an A/B test in the background if configured. Report to the evaluating admin if
+        # this is an evaluation, otherwise to the super admin.
+        if a_b_llm_cfg := cfg.llm.a_b_test_config():
+            spawn_task(
+                run_a_b_test(
+                    bot,
+                    msg,
+                    prepare_llm_input(prepared, purpose, a_b_llm_cfg),
+                    a_b_llm_cfg,
+                    a_verdict=verdict,
+                    reevaluate=parsed.reevaluate,
+                    target=sender.id if is_evaluation else cfg.admins[0],
+                ),
+                "A/B test",
+            )
+
+        return not verdict.spam
     except DeferredLLMError:
         # Fail open to avoid false positives. Will be reported asynchronously by report_error.
         return True
@@ -324,19 +408,21 @@ async def ban_user(bot: Bot, msg: Message, user: User) -> None:
 async def attempt_delete_ban(
     bot: Bot,
     msg: Message,
-    parsed: ParsedMessage,
-    reasoning: str,
-    prob: float | None = None,
-    sample_probs: list[float] = [],
+    prepared: ParsedMessage | LLMContent,
+    reasoning: str | Verdict,
 ):
     """
     Attempt to delete the message and ban the sender, and forward the message to the monitor chat with the reasoning.
 
-    Without sample_probs, the message is recorded as spam with the non-LLM reasoning; LLM checks
+    If reasoning is a string, the message is recorded as spam with the non-LLM reasoning; LLM checks
     record their samples themselves.
     """
-    if not sample_probs:
-        record_checked_message(msg, parsed, True, reasoning=reasoning)
+    if isinstance(reasoning, str):
+        verdict = Verdict(spam=True, reasoning=reasoning)
+        record_checked_message(msg, prepared, verdict)
+    else:
+        # The LLM path also records non-spam verdicts, so it already records all checks itself.
+        verdict = reasoning
 
     sender = cast(User, msg.from_user)
     caller = msg.guest_bot_caller_user
@@ -418,18 +504,17 @@ async def attempt_delete_ban(
             or msg.chat.effective_name
             or str(msg.chat.id)
         )
-        sampled = sampled_prob_range(sample_probs)
         parts: list[str] = []
         if monitor != msg.chat.id:
             parts.append(f"Posted by {user_name} in {chat_name}")
-        if prob is not None:
-            parts.append(f"Spam probability: {prob:.2f}{sampled}")
+        if verdict.sample_probs:
+            parts.append(f"Spam probability: {verdict.sample_range}")
         if no_delete:
             parts.append(no_delete)
         if no_ban:
             parts.append(no_ban)
-        if reasoning:
-            parts.append(f"Reasoning: {reasoning}")
+        if verdict.reasoning:
+            parts.append(f"Reasoning: {verdict.reasoning}")
         await bot.send_message(
             chat_id=monitor,
             reply_to_message_id=reply_to,

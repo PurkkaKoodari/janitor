@@ -49,9 +49,9 @@ _message_logger: ContextVar[_PrefixLoggerAdapter | logging.Logger] = ContextVar(
 
 
 @contextmanager
-def message_logging(chat_id: int, msg_id: int) -> Generator[None, None, None]:
-    """Set a per-message logger that prepends ``[chat:msg]`` to every message logged via `logger`."""
-    adapter = _PrefixLoggerAdapter(base_logger, f"[{chat_id}:{msg_id}]")
+def message_logging(chat_id: int, msg_id: int, extra: str = "") -> Generator[None, None, None]:
+    """Set a per-message logger that prepends ``[chat:msg:extra]`` to every message logged via `logger`."""
+    adapter = _PrefixLoggerAdapter(base_logger, f"[{chat_id}:{msg_id}{extra and f":{extra}"}]")
     token = _message_logger.set(adapter)
     try:
         yield

@@ -272,21 +272,28 @@ async def fetch_tme_description(url: str) -> str:
     return (parser.description or "").strip()
 
 
+# CJK spam is often very short, so always check messages containing CJK characters.
 CJK_REGEX = re.compile(r"[\u4E00-\u9FFF]")
 TME_LINK_REGEX = re.compile(r"https?://t\.me/[^\s)\]]+")
 
 
-async def prepare_llm_input(parsed: ParsedMessage, *, force: bool = False) -> str | None:
+async def llm_user_message(parsed: ParsedMessage) -> tuple[str, bool]:
     """Build the user message content to send to the LLM, embedding attachment info and any
     linked Telegram post description as an <attachments> tag, as described in the system
     prompt's <message_format> section.
 
-    Return None if the message has too little data to be worth checking via LLM, unless forced."""
+    Return the user message and a boolean indicating if the message has enough data to be worth checking via LLM.
+    """
     # A media with a description always gets forwarded to the LLM.
     # This is checked via formatting, as any media_info usually exceeds cfg.llm.min_length.
     text = parsed.text
     media_info = parsed.media
-    force_llm = force or "\n\n" in media_info or ":" in media_info
+    viable = (
+        len(text) >= cfg.llm.min_length
+        or "\n\n" in media_info
+        or ":" in media_info
+        or bool(CJK_REGEX.search(text))
+    )
 
     tme_link = TME_LINK_REGEX.search(text)
     if tme_link:
@@ -294,18 +301,12 @@ async def prepare_llm_input(parsed: ParsedMessage, *, force: bool = False) -> st
         if description:
             media_info = f"{media_info}\n\nThe message contains a Telegram link with the description:\n\n{description}".strip()
             # A Telegram link with a description always gets forwarded to the LLM.
-            force_llm = True
-
-    # CJK spam is often very short, so always check messages containing CJK characters.
-    if CJK_REGEX.search(text):
-        force_llm = True
+            viable = True
 
     if media_info:
         media_info = f"<attachments>{media_info}</attachments>"
 
     # Short-circuit the LLM check for short messages, as they are unlikely to be spam
     # and it's not worth the cost and false positives to check them.
-    if len(text) < cfg.llm.min_length and not force_llm:
-        return None
-
-    return f"{text}\n\n{media_info}".strip()
+    user_message = f"{text}\n\n{media_info}".strip()
+    return user_message, viable

@@ -20,7 +20,7 @@
 import asyncio, json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 import httpx
 
@@ -38,8 +38,10 @@ from openrouter.errors import (
     OpenRouterError,
 )
 
-from janitorbot.config import cfg
+from janitorbot.config import LLMConfig, cfg
 from janitorbot.log import logger
+from janitorbot.models import Verdict
+from janitorbot.util import spawn_task
 
 or_client = openrouter.OpenRouter(api_key=cfg.llm.openrouter_key)
 
@@ -88,20 +90,21 @@ async def _resolve_provider(e: Exception, response: ChatResult | None) -> str | 
         return None
 
 
-async def llm_api(user_message: str, system_prompt: str) -> ChatResult:
+async def llm_api(user_message: str, system_prompt: str, llm_cfg: LLMConfig) -> ChatResult:
     """
-    Call the LLM API with the given user message and system prompt, and return the response.
+    Call the LLM API with the given user message, system prompt and LLM config, and return the
+    response.
     """
     return await or_client.chat.send_async(
-        model=cfg.llm.model,
+        model=llm_cfg.model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
         max_tokens=3000,
-        temperature=cfg.llm.temperature,
+        temperature=llm_cfg.temperature,
         reasoning=Reasoning(
-            effort=cfg.llm.reasoning_effort,
+            effort=llm_cfg.reasoning_effort,
             summary="auto",
         ),
         response_format=ChatFormatJSONSchemaConfig(
@@ -150,7 +153,7 @@ class LLMError(Exception):
 
     causes: list[Exception]
     fatal: bool
-    is_provider_issue: bool
+    should_report: bool
     provider: str | None
     usage: int | None
     finish_reason: str | None
@@ -184,6 +187,7 @@ async def _handle_llm_error(
     exc: Exception,
     fatal: bool,
     report: Callable[[LLMError], Awaitable[None]] | None,
+    llm_cfg: LLMConfig,
 ) -> LLMError:
     """
     Handle an LLM error, reporting it to the super admin if configured.
@@ -197,12 +201,12 @@ async def _handle_llm_error(
     if isinstance(exc, TimeoutError):
         # Timeout. Ditch the original stack trace, those are ugly with asyncio.
         exc = TimeoutError(
-            f"LLM check timed out after {cfg.llm.timeout} seconds "
+            f"LLM check timed out after {llm_cfg.timeout} seconds "
             f"- slow provider or too low max tokens?"
         )
         try:
             # Wait a while longer to get a response.
-            response = await asyncio.wait_for(fetch, timeout=20 * cfg.llm.timeout)
+            response = await asyncio.wait_for(fetch, timeout=20 * llm_cfg.timeout)
             _parse_llm_response(response)
         except httpx.HTTPError as later_exc:
             # The fetch failed on the HTTP layer. Ignore the timeout which is likely a side effect.
@@ -211,7 +215,7 @@ async def _handle_llm_error(
             # Timed out even with the longer wait. Report that as a provider issue.
             errors = [
                 TimeoutError(
-                    f"LLM check timed out, no response within {20 * cfg.llm.timeout} seconds "
+                    f"LLM check timed out, no response within {20 * llm_cfg.timeout} seconds "
                     f"- slow provider or too low max tokens?"
                 )
             ]
@@ -266,7 +270,7 @@ async def _handle_llm_error(
     error = LLMError(
         causes=errors,
         fatal=fatal,
-        is_provider_issue=is_provider_issue,
+        should_report=fatal or (is_provider_issue and llm_cfg.report_provider_issues),
         provider=provider,
         usage=usage,
         finish_reason=finish_reason,
@@ -283,64 +287,63 @@ async def _handle_llm_error(
     return error
 
 
-_error_handling_tasks = set[asyncio.Task[Any]]()
-
-
 def _handle_llm_error_async(
     fetch: asyncio.Task[ChatResult],
     exc: Exception,
     fatal: bool,
     report: Callable[[LLMError], Awaitable[None]] | None,
+    llm_cfg: LLMConfig,
 ) -> asyncio.Task[LLMError]:
     """
     Handle an LLM error asynchronously, reporting it to the super admin if configured.
 
     This is a fire-and-forget wrapper around ``handle_llm_error`` that runs in the background.
     """
-    handle = asyncio.create_task(_handle_llm_error(fetch, exc, fatal=fatal, report=report))
-    _error_handling_tasks.add(handle)
-    handle.add_done_callback(_error_handling_tasks.remove)
-    return handle
+    return spawn_task(
+        _handle_llm_error(fetch, exc, fatal=fatal, report=report, llm_cfg=llm_cfg),
+        "LLM error handling",
+    )
 
 
 async def llm_check(
     user_message: str,
     system_prompt: str,
     *,
-    retry: int = cfg.llm.retry_count,
+    llm_cfg: LLMConfig = cfg.llm,
+    attempt: int = 1,
     recursive: bool = False,
     report_error: Callable[[LLMError], Awaitable[None]] | None = None,
-) -> tuple[float, str, list[tuple[float, str]]]:
+) -> Verdict:
     """
-    Check the message with the LLM and react to spam.
+    Check the message with the LLM using the given LLM config.
 
     If the result reaches the multisample threshold and this is not itself a recursive
     (multisample) call, the check is repeated in parallel and the median result is used.
 
-    Returns a tuple of (spam_probability, reasoning, samples).
+    Returns the verdict, with the samples to store in the database.
     """
     # Wrap the call in a task so we can await it multiple times.
-    task = asyncio.create_task(llm_api(user_message, system_prompt))
+    task = asyncio.create_task(llm_api(user_message, system_prompt, llm_cfg))
     try:
-        response = await asyncio.wait_for(asyncio.shield(task), timeout=cfg.llm.timeout)
+        response = await asyncio.wait_for(asyncio.shield(task), timeout=llm_cfg.timeout)
         prob, reasoning, usage = _parse_llm_response(response)
         logger.info("LLM result: %s tokens, spam probability: %.2f", usage or "?", prob)
     except Exception as exc:
         # If the error is obviously the operator's problem, don't bother retrying.
-        if isinstance(exc, OPERATOR_ERRORS):
-            retry = 0
+        retry = attempt <= llm_cfg.retry_count and not isinstance(exc, OPERATOR_ERRORS)
 
         # Process the error further asynchronously.
         handle = _handle_llm_error_async(
-            task, exc, fatal=not retry and not recursive, report=report_error
+            task, exc, fatal=not retry and not recursive, report=report_error, llm_cfg=llm_cfg
         )
 
         if retry:
-            await asyncio.sleep(cfg.llm.retry_delay)
+            await asyncio.sleep(llm_cfg.retry_delay)
             return await llm_check(
                 user_message,
                 system_prompt,
-                retry=retry - 1,
+                llm_cfg=llm_cfg,
+                attempt=attempt + 1,
                 recursive=recursive,
                 report_error=report_error,
             )
@@ -348,23 +351,29 @@ async def llm_check(
             raise DeferredLLMError(f"{type(exc).__name__}: {str(exc)}", handle) from exc
 
     # Complain if the provider returned no reasoning.
-    if cfg.llm.report_no_reasoning and not reasoning.strip():
+    if llm_cfg.report_no_reasoning and not reasoning.strip():
         exc = ValueError("No reasoning returned by OpenRouter")
-        _handle_llm_error_async(task, exc, fatal=False, report=report_error)
+        _handle_llm_error_async(task, exc, fatal=False, report=report_error, llm_cfg=llm_cfg)
 
     samples = [(prob, reasoning)]
 
     # Multisample if the probability is above the threshold and this is the initial call.
-    if not recursive and cfg.llm.multisample_count >= 2 and prob >= cfg.llm.multisample_threshold:
+    if not recursive and llm_cfg.multisample_count >= 2 and prob >= llm_cfg.multisample_threshold:
         logger.info(
             "Spam probability %.2f reached multisample threshold, sampling %d more time(s)...",
             prob,
-            cfg.llm.multisample_count - 1,
+            llm_cfg.multisample_count - 1,
         )
         further = await asyncio.gather(
             *(
-                llm_check(user_message, system_prompt, recursive=True, report_error=report_error)
-                for _ in range(cfg.llm.multisample_count - 1)
+                llm_check(
+                    user_message,
+                    system_prompt,
+                    llm_cfg=llm_cfg,
+                    recursive=True,
+                    report_error=report_error,
+                )
+                for _ in range(llm_cfg.multisample_count - 1)
             ),
             return_exceptions=True,
         )
@@ -377,4 +386,11 @@ async def llm_check(
             len(samples),
         )
 
-    return (prob, reasoning, samples)
+    return Verdict(
+        cached=False,
+        prob=prob,
+        spam=prob >= llm_cfg.threshold,
+        reasoning=reasoning,
+        samples_to_store=samples,
+        sample_probs=sorted(prob for prob, _ in samples),
+    )

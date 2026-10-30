@@ -27,7 +27,7 @@ No test suite exists. `config.toml` must exist (copy from `config.example.toml`)
 ## Code style
 
 - Always use type annotations.
-- Docstrings for all functions and classes.
+- Add docstrings for all new functions and classes, update existing ones. Humans may decide to omit docstrings.
 - Use f-strings for formatting.
 - Black, line length 100, target Python 3.13.
 - Always run Black after finalizing code changes.
@@ -37,6 +37,8 @@ No test suite exists. `config.toml` must exist (copy from `config.example.toml`)
 The bot logic lives in the `janitorbot/` package, split into focused modules. Config, DB, and OpenRouter client are initialized at **module level** on import.
 
 - `janitorbot/log.py` — logging setup and the per-message `logger` proxy
+- `janitorbot/util.py` — `spawn_task` for tracked fire-and-forget background tasks
+- `janitorbot/models.py` — shared data classes, such as the `Verdict` of a spam check
 - `janitorbot/config.py` — Pydantic config models and the `cfg` loaded from `config.toml`
 - `janitorbot/db.py` — SQLite connection, table setup, and the `effective_*` / `chat_purpose` / `chat_mode` helpers
 - `janitorbot/llm.py` — LLM calls and OpenRouter request/response/error handling
@@ -48,8 +50,6 @@ The bot logic lives in the `janitorbot/` package, split into focused modules. Co
 - `janitorbot/search.py` — admin DM lookups of recorded reasonings: forwarded messages (falling back to simulation if unmatched) and `/search` messages
 - `janitorbot/main.py` — message routing/spam-check orchestration (`process_message` / `process_edit`, admin DM command handling in `process_admin_commands`), the message handlers, auto-restart watcher, handler registration, `main()`
 - `janitor.py` — thin launcher (`from janitorbot.main import main`)
-
-Import chain (acyclic): `log` ← `config` ← `db` ← `llm` ← `messages` ← `channel` ← `state` ← `spam` ← `commands` ← `search` ← `main`. Module-level side effects (load `cfg`, open DB, build `or_client`) fire in that order.
 
 ### Chat roles
 
@@ -73,10 +73,11 @@ Import chain (acyclic): `log` ← `config` ← `db` ← `llm` ← `messages` ←
    - Messages shorter than `llm.min_length` skip LLM
    - LLM call via OpenRouter returns `{"prob": float}` using structured JSON output
    - If `prob >= threshold`, calls `attempt_delete_ban`
+   - If `[llm.a_b_test]` overrides are set (`LLMConfig.a_b_test_config()`), the message is re-checked in the background with the B config and differing verdicts are reported
 3. **Channel forwarding** (`forward_to_channel`, called by `process_message` once spam checks pass): ignore rules → length heuristics → copies to channel with "See message" / "Delete this" buttons
 4. The `messages` SQLite table maps channel message IDs → original message IDs + author, enabling reply threading and self-deletion
 
-Every spam-checked message is recorded in the `spam_messages` table. LLM verdicts are cached: a message whose LLM input matches identically reuses the median of all recorded probabilities for it instead of calling the LLM.
+Every spam-checked message is recorded in the `spam_messages` table, with its check in `spam_checks`. LLM verdicts are cached: a message whose LLM input matches identically reuses the median of all recorded probabilities for it instead of calling the LLM. The cache key covers the system prompt, model, temperature and reasoning effort.
 
 ### Moderation modes (per chat, default `spam.mode`)
 
@@ -91,13 +92,15 @@ A background daemon thread (`_watch_and_restart`) polls `janitor.py`, `config.to
 ### SQLite schema
 
 - `messages(id, orig_id, author)` — channel msg id → source msg id + author user id
-- `spam_messages(chat_id, message_id, llm_sample, ...)` — one row per LLM sample
-  - If not LLM-checked, single row with `llm_sample`/`llm_prob` NULL and the non-LLM reasoning or error in `llm_reasoning`
+- `spam_messages(chat_id, message_id, user_id, timestamp, system, spam, mentions, check_id)` — one row per check of a message, used for per-user moderation queries
   - Edits add new rows (but may reuse cached verdicts)
+  - Joins are recorded as `system` rows for each joined user, with no check
   - No primary key
+- `spam_checks(check_id, sample, chat_id, message_id, timestamp, ...)` — one row per LLM sample of a check of a message
+  - If not LLM-checked, single row with `prob` NULL and the non-LLM reasoning or error in `reasoning`
+  - Non-primary checks (A/B test B side) have `spam` NULL and no `spam_messages` row, so they only affect verdict caching and cached reasoning lookups
   - `text_hash` hashes only the text and is recorded for every spam check, so searches can fall back to it when attachments differ or the verdict was not from the LLM
-  - Cached verdicts are a single sample with `llm_reasoning` = `CACHED_REASONING`
-  - Joins are recorded as `system` rows for each joined user
+  - Cached verdicts are a single sample with `reasoning` = `CACHED_REASONING`
   - Reasonings are replaced with `PURGED_REASONING` after `reasoning_retention_days`
 - `chats(id, purpose, mode, delete_join_leave)` — dynamically added moderated chats and per-chat setting overrides (NULL = config default); cached in memory as `db_chats`
 - `admins(id)` — dynamically added admin user IDs
